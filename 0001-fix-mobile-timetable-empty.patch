@@ -1,0 +1,60 @@
+From 10c88ab709264d074f919f598f6c16439ddda38a Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Sun, 26 Apr 2026 13:38:55 +0530
+Subject: [PATCH] =?UTF-8?q?fix:=20mobile=20timetable=20empty=20=E2=80=94?=
+ =?UTF-8?q?=20map=20day=5Fof=5Fweek=20int=20to=20lowercase=20day=20name?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Mobile app expects schedule keyed by 'monday'..'sunday' but controller
+grouped by the raw day_of_week integer (1..7), so every day showed
+"No classes" for both teacher and student timetable views.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ app/Http/Controllers/Api/MobileApiController.php | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index ae2bbd0..3eae701 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -595,6 +595,12 @@ public function timetable(Request $request): JsonResponse
+         $yearId    = app()->bound('current_academic_year_id') ? app('current_academic_year_id') : null;
+         $schedule  = [];
+ 
++        // day_of_week is stored as int (1=Mon..7=Sun); mobile app expects lowercase day names.
++        $dayNames = [
++            1 => 'monday', 2 => 'tuesday', 3 => 'wednesday',
++            4 => 'thursday', 5 => 'friday', 6 => 'saturday', 7 => 'sunday',
++        ];
++
+         if ($user->isTeacher() && $user->staff) {
+             $items = Timetable::where('school_id', $school->id)
+                 ->where('staff_id', $user->staff->id)
+@@ -602,7 +608,9 @@ public function timetable(Request $request): JsonResponse
+                 ->get();
+ 
+             foreach ($items as $item) {
+-                $schedule[$item->day_of_week][] = [
++                $dayKey = $dayNames[$item->day_of_week] ?? null;
++                if (!$dayKey) continue;
++                $schedule[$dayKey][] = [
+                     'period_name'  => $item->period->name        ?? "Period {$item->period_id}",
+                     'subject_name' => $item->subject->name       ?? 'Unknown',
+                     'class_name'   => $item->courseClass->name   ?? '',
+@@ -626,7 +634,9 @@ public function timetable(Request $request): JsonResponse
+                     ->get();
+ 
+                 foreach ($items as $item) {
+-                    $schedule[$item->day_of_week][] = [
++                    $dayKey = $dayNames[$item->day_of_week] ?? null;
++                    if (!$dayKey) continue;
++                    $schedule[$dayKey][] = [
+                         'period_name'  => $item->period->name           ?? "Period {$item->period_id}",
+                         'subject_name' => $item->subject->name          ?? 'Unknown',
+                         'teacher_name' => $item->staff->user->name      ?? '',
+-- 
+2.52.0.windows.1
+

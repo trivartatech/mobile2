@@ -1,0 +1,64 @@
+From 68870b544faefb477b32e51bcaa73b86dd96ada9 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Sun, 26 Apr 2026 19:38:52 +0530
+Subject: [PATCH] fix: User Management page size honours System Config "Page
+ Length"
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Was hardcoded paginate(20). Admins setting 100 in
+School Settings → System Config → Page Length saw their preference
+ignored on this page.
+
+Adds a reusable School::pageLength(int \$fallback = 20) helper that
+reads settings.page_length and clamps to [5, 100] (matching the
+SystemConfig form validation). UserManagementController::index now
+uses it.
+
+Other paginated lists in the app could adopt the same helper —
+not changed in this commit to keep the patch focused.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/School/UserManagementController.php    |  4 +++-
+ app/Models/School.php                                  | 10 ++++++++++
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/app/Http/Controllers/School/UserManagementController.php b/app/Http/Controllers/School/UserManagementController.php
+index 8aa4ff9..6f1dd36 100644
+--- a/app/Http/Controllers/School/UserManagementController.php
++++ b/app/Http/Controllers/School/UserManagementController.php
+@@ -63,7 +63,9 @@ public function index(Request $request)
+             }
+         }
+ 
+-        $users = $query->latest()->paginate(20)->withQueryString();
++        // Page size honours the school's System Config "Page Length" setting.
++        $perPage = app('current_school')?->pageLength() ?? 20;
++        $users = $query->latest()->paginate($perPage)->withQueryString();
+ 
+         return Inertia::render('School/Users/Index', [
+             'users'     => $users,
+diff --git a/app/Models/School.php b/app/Models/School.php
+index 194fa1f..c159975 100644
+--- a/app/Models/School.php
++++ b/app/Models/School.php
+@@ -79,4 +79,14 @@ public function timeFmt(): string
+             default      => 'g:i A',
+         };
+     }
++
++    /**
++     * Default rows-per-page from System Config. Clamped to [5, 100] to
++     * match the SystemConfig form validation. Use with paginate($school->pageLength()).
++     */
++    public function pageLength(int $fallback = 20): int
++    {
++        $n = (int) ($this->settings['page_length'] ?? $fallback);
++        return max(5, min(100, $n));
++    }
+ }
+-- 
+2.52.0.windows.1
+

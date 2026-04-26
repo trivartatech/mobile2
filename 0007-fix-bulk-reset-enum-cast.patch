@@ -1,0 +1,46 @@
+From 82c88ab2b50e9010ea964414ec16f27ef9002208 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Sun, 26 Apr 2026 19:16:26 +0530
+Subject: [PATCH] =?UTF-8?q?fix:=20bulk=20reset=20failed=20=E2=80=94=20user?=
+ =?UTF-8?q?=5Ftype=20is=20a=20backed=20enum,=20not=20a=20string?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+PHP 8 throws an Error when you cast a backed enum to string directly:
+(string) UserType::Parent → Error: Object of class UserType could not
+be converted to string.
+
+bulkReset() was hitting that on every user. Now uses ->value when the
+attribute is a BackedEnum, falls back to string cast otherwise. Also
+formats roles like 'super_admin' → 'Super admin' for display in the
+exported credentials table.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ app/Http/Controllers/School/UserManagementController.php | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/app/Http/Controllers/School/UserManagementController.php b/app/Http/Controllers/School/UserManagementController.php
+index e17d724..093856d 100644
+--- a/app/Http/Controllers/School/UserManagementController.php
++++ b/app/Http/Controllers/School/UserManagementController.php
+@@ -276,9 +276,14 @@ public function bulkReset(Request $request)
+             foreach ($users as $u) {
+                 $newPassword = Str::random(10);
+                 $u->update(['password' => Hash::make($newPassword)]);
++                // user_type is a backed enum (App\Enums\UserType), so we must
++                // pull ->value rather than relying on string cast.
++                $role = $u->user_type instanceof \BackedEnum
++                    ? $u->user_type->value
++                    : (string) ($u->user_type ?? '');
+                 $rows[] = [
+                     'name'     => $u->name,
+-                    'role'     => ucfirst((string) $u->user_type),
++                    'role'     => ucfirst(str_replace('_', ' ', $role)),
+                     'username' => $u->username,
+                     'password' => $newPassword,
+                 ];
+-- 
+2.52.0.windows.1
+

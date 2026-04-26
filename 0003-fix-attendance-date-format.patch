@@ -1,0 +1,92 @@
+From e5f0c8861a4bcc2454611a85f067c27f5560f6d7 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Sun, 26 Apr 2026 14:33:34 +0530
+Subject: [PATCH] fix: format mobile attendance dates per admin system-config
+ setting
+
+Mobile attendance screen was rendering raw ISO datetimes (e.g.
+'2026-04-01T18:30:00.000000Z') because the API returned the Eloquent
+date cast directly. Now formats records[].date using the school's
+date_format setting from System Config.
+
+Adds reusable School::dateFmt() / School::timeFmt() helpers that map
+the admin-panel choices ('DD/MM/YYYY', 'h:mm A', etc.) to PHP date()
+strings. Mirrors the mapping in app/Traits/Exportable.php.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/Api/MobileApiController.php   | 14 +++++++++--
+ app/Models/School.php                         | 23 +++++++++++++++++++
+ 2 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index b33e6b5..b6195c4 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -527,9 +527,14 @@ public function attendance(Request $request): JsonResponse
+                 ? round(($summary['present'] + $summary['late'] * 0.5) / $summary['total'] * 100, 1)
+                 : 0;
+ 
++            $dateFmt = $school->dateFmt();
+             return response()->json([
+                 'summary' => $summary,
+-                'records' => $records,
++                'records' => $records->map(fn($r) => [
++                    'date'    => optional($r->date)->format($dateFmt),
++                    'status'  => $r->status,
++                    'remarks' => $r->remarks,
++                ]),
+             ]);
+         }
+ 
+@@ -555,9 +560,14 @@ public function attendance(Request $request): JsonResponse
+             ? round(($summary['present'] + $summary['late'] * 0.5) / $summary['total'] * 100, 1)
+             : 100;
+ 
++        $dateFmt = $school->dateFmt();
+         return response()->json([
+             'summary'    => $summary,
+-            'records'    => $records,
++            'records'    => $records->map(fn($r) => [
++                'date'    => optional($r->date)->format($dateFmt),
++                'status'  => $r->status,
++                'remarks' => $r->remarks,
++            ]),
+             'student_id' => $studentId,
+         ]);
+     }
+diff --git a/app/Models/School.php b/app/Models/School.php
+index a765cb0..194fa1f 100644
+--- a/app/Models/School.php
++++ b/app/Models/School.php
+@@ -56,4 +56,27 @@ public function hasFeature(string $feature): bool
+     {
+         return isset($this->features[$feature]) && $this->features[$feature] === true;
+     }
++
++    /** PHP date() format string from the admin's system-config date_format setting. */
++    public function dateFmt(): string
++    {
++        return match($this->settings['date_format'] ?? '') {
++            'DD/MM/YYYY'  => 'd/m/Y',
++            'MM/DD/YYYY'  => 'm/d/Y',
++            'YYYY-MM-DD'  => 'Y-m-d',
++            'D MMM, YYYY' => 'j M, Y',
++            default        => 'd/m/Y',
++        };
++    }
++
++    /** PHP date() format string from the admin's system-config time_format setting. */
++    public function timeFmt(): string
++    {
++        return match($this->settings['time_format'] ?? '') {
++            'h:mm A'    => 'g:i A',
++            'H:mm'      => 'H:i',
++            'h:mm:ss A' => 'g:i:s A',
++            default      => 'g:i A',
++        };
++    }
+ }
+-- 
+2.52.0.windows.1
+

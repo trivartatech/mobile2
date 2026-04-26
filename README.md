@@ -13,6 +13,7 @@ Standalone patches for the `school-erp` Laravel API. Apply them on a deployment 
 | `0005-fix-admission-default-password.patch` | New parent admissions used to get a random unprintable password — admins couldn't tell parents how to log in to the mobile app. Now sets the default password to `parent123` (matches the existing `portal:create-users` artisan command). One-line change to `AdmissionService::admit()`. |
 | `0006-feat-user-management-bulk-actions.patch` | Admin panel User Login Management gets four upgrades: (a) "Create Missing Logins" button auto-creates User rows for any students/parents who don't have one yet (defaults: parent123 / student-DOB). (b) Class + Section filter now also applies to parents (filters by their children's class). (c) Bulk-reset passwords for selected users with one click. (d) Export resulting credentials to Excel or PDF. **Note**: this patch is large (~1k lines) — touches the User Management controller, Vue page, routes, plus a new Excel exporter and PDF blade view. If the other domain has diverged on these files, expect conflicts. |
 | `0007-fix-bulk-reset-enum-cast.patch` | Hotfix on top of patch 6 — bulk-reset 500'd in PHP 8 because `user_type` is a backed enum and `(string) $enum` throws. Now uses `->value`. **Apply patch 7 immediately after patch 6** if you've applied 6. |
+| `0008-fix-csrf-419-bulk-actions.patch` | Hotfix on top of patches 6 & 7 — every fetch in `Users/Index.vue` was sending `X-CSRF-TOKEN: undefined` because `usePage().props.csrf_token` isn't a shared Inertia prop in this app. New `csrfHeader()` helper reads the `XSRF-TOKEN` cookie (always fresh, axios-style) and sends it as `X-XSRF-TOKEN`. Frontend-only — needs `npm run build` after applying. |
 
 Patches 1, 2, 4 touch `app/Http/Controllers/Api/MobileApiController.php`. Patch 3 touches the same controller plus `app/Models/School.php`. Patch 4 also adds a route in `routes/api.php`. Patch 5 touches `app/Services/AdmissionService.php`. Patch 6 touches `app/Http/Controllers/School/UserManagementController.php`, `app/Exports/UserCredentialsExport.php` (new), `resources/views/exports/user-credentials.blade.php` (new), `resources/js/Pages/School/Users/Index.vue`, and `routes/web.php`. They apply cleanly in order.
 
@@ -31,12 +32,13 @@ curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0004-fix-par
 curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0005-fix-admission-default-password.patch -o /tmp/p5.patch
 curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0006-feat-user-management-bulk-actions.patch -o /tmp/p6.patch
 curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0007-fix-bulk-reset-enum-cast.patch -o /tmp/p7.patch
+curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0008-fix-csrf-419-bulk-actions.patch -o /tmp/p8.patch
 
 # 2. Dry-run — fails loudly if conflicts
-git apply --check /tmp/p1.patch /tmp/p2.patch /tmp/p3.patch /tmp/p4.patch /tmp/p5.patch /tmp/p6.patch /tmp/p7.patch
+git apply --check /tmp/p1.patch /tmp/p2.patch /tmp/p3.patch /tmp/p4.patch /tmp/p5.patch /tmp/p6.patch /tmp/p7.patch /tmp/p8.patch
 
 # 3. Apply
-git apply /tmp/p1.patch /tmp/p2.patch /tmp/p3.patch /tmp/p4.patch /tmp/p5.patch /tmp/p6.patch /tmp/p7.patch
+git apply /tmp/p1.patch /tmp/p2.patch /tmp/p3.patch /tmp/p4.patch /tmp/p5.patch /tmp/p6.patch /tmp/p7.patch /tmp/p8.patch
 
 # 3b. Patch 6 modified a Vue file — rebuild the frontend bundle
 npm install --no-audit --no-fund

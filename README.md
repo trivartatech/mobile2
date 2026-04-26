@@ -10,8 +10,9 @@ Standalone patches for the `school-erp` Laravel API. Apply them on a deployment 
 | `0002-fix-teacher-attendance-empty.patch` | Teacher Attendance tab showed 0% with no records (server's `attendance()` had no teacher branch — only resolved student attendance). Adds a `staff_attendances` lookup for teachers. |
 | `0003-fix-attendance-date-format.patch` | Attendance records rendered raw ISO datetimes like `2026-04-01T18:30:00.000000Z`. Now formats `records[].date` using the school's `date_format` setting from Admin → Settings → System Config. Also adds reusable `School::dateFmt()` / `School::timeFmt()` helpers for future use. |
 | `0004-fix-parent-flow-server.patch` | Three parent-flow fixes: (a) `childList()` returned wrong keys so children showed name only — now returns `class_name`, `section_name`, `admission_number`, `roll_number`, `attendance_pct`. (b) Mobile parent BusTracking screen polled `/api/bus/status` which 404'd — added the route and `MobileApiController::busStatus()` returning running/stopped/idle for the active child's bus. (c) Payment history & receipt now include `payment_date_display` formatted per the admin's `date_format` setting (alongside the existing `payment_date` field for backward compat). |
+| `0005-fix-admission-default-password.patch` | New parent admissions used to get a random unprintable password — admins couldn't tell parents how to log in to the mobile app. Now sets the default password to `parent123` (matches the existing `portal:create-users` artisan command). One-line change to `AdmissionService::admit()`. |
 
-Patches 1, 2, 4 touch `app/Http/Controllers/Api/MobileApiController.php`. Patch 3 touches the same controller plus `app/Models/School.php`. Patch 4 also adds a route in `routes/api.php`. They apply cleanly in order.
+Patches 1, 2, 4 touch `app/Http/Controllers/Api/MobileApiController.php`. Patch 3 touches the same controller plus `app/Models/School.php`. Patch 4 also adds a route in `routes/api.php`. Patch 5 touches `app/Services/AdmissionService.php`. They apply cleanly in order.
 
 ## How to apply on another live server
 
@@ -23,12 +24,13 @@ curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0001-fix-mob
 curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0002-fix-teacher-attendance-empty.patch -o /tmp/p2.patch
 curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0003-fix-attendance-date-format.patch -o /tmp/p3.patch
 curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0004-fix-parent-flow-server.patch -o /tmp/p4.patch
+curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0005-fix-admission-default-password.patch -o /tmp/p5.patch
 
 # 2. Dry-run — fails loudly if conflicts
-git apply --check /tmp/p1.patch /tmp/p2.patch /tmp/p3.patch /tmp/p4.patch
+git apply --check /tmp/p1.patch /tmp/p2.patch /tmp/p3.patch /tmp/p4.patch /tmp/p5.patch
 
 # 3. Apply
-git apply /tmp/p1.patch /tmp/p2.patch /tmp/p3.patch /tmp/p4.patch
+git apply /tmp/p1.patch /tmp/p2.patch /tmp/p3.patch /tmp/p4.patch /tmp/p5.patch
 
 # 4. Reload PHP so OPcache picks up the new code
 php artisan queue:restart

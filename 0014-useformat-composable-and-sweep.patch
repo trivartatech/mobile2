@@ -1,0 +1,524 @@
+From 5bbe5e4bd7fb5980e69b9f116f85c91f864592e0 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Sun, 26 Apr 2026 21:41:10 +0530
+Subject: [PATCH] feat: useFormat composable + sweep date displays to honour
+ System Config
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds resources/js/Composables/useFormat.js — a shared Vue composable
+that reads the school's date_format / time_format from the Inertia
+shared props (school.settings) and exposes:
+  formatDate(d), formatTime(t), formatDateTime(dt), formatMoney(n)
+
+Falls back gracefully:
+  - empty / null  → '—'
+  - invalid Date  → passthrough (server-formatted strings render as-is)
+  - missing settings → DD/MM/YYYY default
+
+Replaced the per-page hardcoded en-IN formatters in 21 admin pages so
+they now honour whatever the admin sets in
+School Settings → System Config → Date Format / Time Format. Touched:
+
+  Alumni/Index, Disciplinary/Index, Fee/StructureHistory,
+  Hostel/GatePasses/StudentPortal, Houses/Show,
+  Inventory/{Index,Reports,Show}, Library/Issues,
+  PTM/{Index,SessionDetail}, Quiz/{Index,MyQuizzes,Results},
+  Staff/{History,HistoryLog,Punch}, Setup/RolloverWizard,
+  Transport/Attendance/Report,
+  Examinations/{MarkSummary,Results}/Print
+
+Decorative inline calls (e.g. extracting just the weekday short name
+or month abbreviation in calendar headers) were left alone — those
+aren't full-date displays and the System Config doesn't have a
+single-component format equivalent.
+
+Documentation examples in Settings/NumberFormats.vue and Fee/Config.vue
+deliberately left alone — they showcase format tokens like {MON} and
+need a sample date independent of the user's system config.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ resources/js/Composables/useFormat.js         | 104 ++++++++++++++++++
+ resources/js/Pages/School/Alumni/Index.vue    |   3 +-
+ .../js/Pages/School/Disciplinary/Index.vue    |   3 +-
+ .../School/Examinations/MarkSummary/Print.vue |   5 +-
+ .../School/Examinations/Results/Print.vue     |   5 +-
+ .../js/Pages/School/Fee/StructureHistory.vue  |   3 +-
+ .../Hostel/GatePasses/StudentPortal.vue       |   3 +-
+ resources/js/Pages/School/Houses/Show.vue     |   5 +-
+ resources/js/Pages/School/Inventory/Index.vue |   3 +-
+ .../js/Pages/School/Inventory/Reports.vue     |   3 +-
+ resources/js/Pages/School/Inventory/Show.vue  |   3 +-
+ resources/js/Pages/School/Library/Issues.vue  |   3 +-
+ resources/js/Pages/School/PTM/Index.vue       |   3 +-
+ .../js/Pages/School/PTM/SessionDetail.vue     |   5 +-
+ resources/js/Pages/School/Quiz/Index.vue      |   3 +-
+ resources/js/Pages/School/Quiz/MyQuizzes.vue  |   3 +-
+ resources/js/Pages/School/Quiz/Results.vue    |   3 +-
+ .../js/Pages/School/Setup/RolloverWizard.vue  |   5 +-
+ resources/js/Pages/School/Staff/History.vue   |   3 +-
+ .../js/Pages/School/Staff/HistoryLog.vue      |   3 +-
+ resources/js/Pages/School/Staff/Punch.vue     |   5 +-
+ .../School/Transport/Attendance/Report.vue    |   6 +-
+ 22 files changed, 156 insertions(+), 26 deletions(-)
+ create mode 100644 resources/js/Composables/useFormat.js
+
+diff --git a/resources/js/Composables/useFormat.js b/resources/js/Composables/useFormat.js
+new file mode 100644
+index 0000000..46e0879
+--- /dev/null
++++ b/resources/js/Composables/useFormat.js
+@@ -0,0 +1,104 @@
++import { usePage } from '@inertiajs/vue3';
++
++/**
++ * useFormat — date / time / datetime / money formatters that respect the
++ * admin's System Config settings (date_format, time_format, currency).
++ *
++ * Settings come from the school object that HandleInertiaRequests shares
++ * on every page (see app/Http/Middleware/HandleInertiaRequests.php).
++ *
++ * Usage:
++ *   import { useFormat } from '@/Composables/useFormat';
++ *   const { formatDate, formatTime, formatDateTime, formatMoney } = useFormat();
++ *   ...
++ *   {{ formatDate(student.dob) }}             → 27/03/2026
++ *   {{ formatTime(payment.created_at) }}      → 9:30 AM
++ *   {{ formatDateTime(notification.sent_at) }} → 27/03/2026, 9:30 AM
++ *
++ * Falls back gracefully:
++ *   - empty / null / undefined input → '—'
++ *   - already-formatted string (un-parseable Date) → returned as-is
++ *   - missing / unknown setting → DD/MM/YYYY (parents-friendly default)
++ */
++const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
++
++const pad2 = (n) => String(n).padStart(2, '0');
++
++function applyDateFormat(d, format) {
++  const dd   = pad2(d.getDate());
++  const mm   = pad2(d.getMonth() + 1);
++  const yyyy = d.getFullYear();
++  const mmm  = MONTHS_SHORT[d.getMonth()];
++  const dRaw = String(d.getDate());
++
++  // Order matters — replace longest tokens first so partial matches don't clash.
++  return format
++    .replace('YYYY', yyyy)
++    .replace('MMM',  mmm)
++    .replace('DD',   dd)
++    .replace('MM',   mm)
++    .replace(/(?<![A-Z])D(?![A-Z])/, dRaw); // bare D = day-of-month without leading zero
++}
++
++function applyTimeFormat(d, format) {
++  const hours = d.getHours();
++  const mins  = pad2(d.getMinutes());
++  const secs  = pad2(d.getSeconds());
++  const ampm  = hours >= 12 ? 'PM' : 'AM';
++  const h12   = ((hours + 11) % 12) + 1;
++  const h24   = pad2(hours);
++
++  switch (format) {
++    case 'h:mm A':    return `${h12}:${mins} ${ampm}`;
++    case 'H:mm':      return `${h24}:${mins}`;
++    case 'h:mm:ss A': return `${h12}:${mins}:${secs} ${ampm}`;
++    default:          return `${h12}:${mins} ${ampm}`;
++  }
++}
++
++export function useFormat() {
++  const page = usePage();
++
++  const dateFmt = () => page.props.school?.settings?.date_format || 'DD/MM/YYYY';
++  const timeFmt = () => page.props.school?.settings?.time_format || 'h:mm A';
++  const currency = () => page.props.school?.currency || '₹';
++
++  const formatDate = (input) => {
++    if (input === null || input === undefined || input === '') return '—';
++    const d = new Date(input);
++    if (Number.isNaN(d.getTime())) return String(input); // already formatted, pass through
++    return applyDateFormat(d, dateFmt());
++  };
++
++  const formatTime = (input) => {
++    if (input === null || input === undefined || input === '') return '—';
++    // Time-only strings ("HH:MM" or "HH:MM:SS") need a date prefix to parse
++    if (typeof input === 'string' && /^\d{1,2}:\d{2}(:\d{2})?$/.test(input)) {
++      const d = new Date(`1970-01-01T${input}${input.length === 5 ? ':00' : ''}`);
++      if (!Number.isNaN(d.getTime())) return applyTimeFormat(d, timeFmt());
++      return String(input);
++    }
++    const d = new Date(input);
++    if (Number.isNaN(d.getTime())) return String(input);
++    return applyTimeFormat(d, timeFmt());
++  };
++
++  const formatDateTime = (input) => {
++    if (input === null || input === undefined || input === '') return '—';
++    const d = new Date(input);
++    if (Number.isNaN(d.getTime())) return String(input);
++    return `${applyDateFormat(d, dateFmt())}, ${applyTimeFormat(d, timeFmt())}`;
++  };
++
++  const formatMoney = (n, opts = {}) => {
++    const value = Number(n || 0);
++    const sym   = opts.symbol ?? currency();
++    const fixed = opts.fixed ?? false; // 2-decimal version for receipts
++    const num   = fixed
++      ? value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
++      : value.toLocaleString('en-IN');
++    return `${sym}${num}`;
++  };
++
++  return { formatDate, formatTime, formatDateTime, formatMoney, dateFmt, timeFmt };
++}
+diff --git a/resources/js/Pages/School/Alumni/Index.vue b/resources/js/Pages/School/Alumni/Index.vue
+index 570ca3f..fe6c1c5 100644
+--- a/resources/js/Pages/School/Alumni/Index.vue
++++ b/resources/js/Pages/School/Alumni/Index.vue
+@@ -154,7 +154,8 @@ const saveEdit = () => {
+     });
+ };
+ 
+-const fmt = (d) => d ? new Date(d).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDate: fmt } = useFormat();
+ </script>
+ 
+ <template>
+diff --git a/resources/js/Pages/School/Disciplinary/Index.vue b/resources/js/Pages/School/Disciplinary/Index.vue
+index 0cb87a6..b3225bc 100644
+--- a/resources/js/Pages/School/Disciplinary/Index.vue
++++ b/resources/js/Pages/School/Disciplinary/Index.vue
+@@ -150,7 +150,8 @@ const deleteRecord = (id) => {
+ 
+ const severityColor = { minor: '#d97706', moderate: '#f97316', major: '#dc2626' };
+ const statusBadge   = { open: 'badge-amber', under_review: 'badge-blue', resolved: 'badge-green', escalated: 'badge-red' };
+-const fmtDate = (d) => d ? new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDate: fmtDate } = useFormat();
+ </script>
+ 
+ <template>
+diff --git a/resources/js/Pages/School/Examinations/MarkSummary/Print.vue b/resources/js/Pages/School/Examinations/MarkSummary/Print.vue
+index 327cfbc..b0cb53c 100644
+--- a/resources/js/Pages/School/Examinations/MarkSummary/Print.vue
++++ b/resources/js/Pages/School/Examinations/MarkSummary/Print.vue
+@@ -1,6 +1,9 @@
+ <script setup>
+ import { computed } from 'vue';
+ import { Head } from '@inertiajs/vue3';
++import { useFormat } from '@/Composables/useFormat';
++
++const { formatDateTime } = useFormat();
+ 
+ const props = defineProps({
+     schedule:     Object,  // {id, name, class_name}
+@@ -148,7 +151,7 @@ const statLabels = {
+ 
+         <!-- Print date -->
+         <div class="ms-footer">
+-            Printed on: {{ new Date().toLocaleString() }}
++            Printed on: {{ formatDateTime(new Date()) }}
+         </div>
+ 
+     </div>
+diff --git a/resources/js/Pages/School/Examinations/Results/Print.vue b/resources/js/Pages/School/Examinations/Results/Print.vue
+index f6c3868..5f2022d 100644
+--- a/resources/js/Pages/School/Examinations/Results/Print.vue
++++ b/resources/js/Pages/School/Examinations/Results/Print.vue
+@@ -1,6 +1,9 @@
+ <script setup>
+ import { computed } from 'vue';
+ import { Head } from '@inertiajs/vue3';
++import { useFormat } from '@/Composables/useFormat';
++
++const { formatDateTime } = useFormat();
+ 
+ const props = defineProps({
+     schedule:     Object,  // {id, name, class_name}
+@@ -125,7 +128,7 @@ function getSubjectMark(row, subjectId) {
+ 
+         <!-- Print date -->
+         <div class="rs-footer">
+-            Printed on: {{ new Date().toLocaleString() }}
++            Printed on: {{ formatDateTime(new Date()) }}
+         </div>
+ 
+     </div>
+diff --git a/resources/js/Pages/School/Fee/StructureHistory.vue b/resources/js/Pages/School/Fee/StructureHistory.vue
+index d28ee8a..cba91fb 100644
+--- a/resources/js/Pages/School/Fee/StructureHistory.vue
++++ b/resources/js/Pages/School/Fee/StructureHistory.vue
+@@ -26,7 +26,8 @@ const search = () => {
+     }, { preserveState: true, preserveScroll: true });
+ };
+ 
+-const fmt = (d) => d ? new Date(d).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDate: fmt } = useFormat();
+ 
+ const currentEntry = computed(() => props.history.find(h => !h.effective_to));
+ const archivedEntries = computed(() => props.history.filter(h => h.effective_to));
+diff --git a/resources/js/Pages/School/Hostel/GatePasses/StudentPortal.vue b/resources/js/Pages/School/Hostel/GatePasses/StudentPortal.vue
+index 75edf4e..2625d76 100644
+--- a/resources/js/Pages/School/Hostel/GatePasses/StudentPortal.vue
++++ b/resources/js/Pages/School/Hostel/GatePasses/StudentPortal.vue
+@@ -43,7 +43,8 @@ const statusColor = {
+     Returned: 'badge-gray',
+ };
+ 
+-const fmt = (d) => d ? new Date(d).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDate: fmt } = useFormat();
+ </script>
+ 
+ <template>
+diff --git a/resources/js/Pages/School/Houses/Show.vue b/resources/js/Pages/School/Houses/Show.vue
+index 3c7a812..f363f28 100644
+--- a/resources/js/Pages/School/Houses/Show.vue
++++ b/resources/js/Pages/School/Houses/Show.vue
+@@ -107,9 +107,8 @@ function classSection(hs) {
+     if (!h) return '—';
+     return [h.course_class?.name, h.section?.name].filter(Boolean).join(' – ');
+ }
+-function formatDate(dt) {
+-    return dt ? new Date(dt).toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' }) : '';
+-}
++import { useFormat } from '@/Composables/useFormat';
++const { formatDate } = useFormat();
+ </script>
+ 
+ <template>
+diff --git a/resources/js/Pages/School/Inventory/Index.vue b/resources/js/Pages/School/Inventory/Index.vue
+index 1518f69..8051da8 100644
+--- a/resources/js/Pages/School/Inventory/Index.vue
++++ b/resources/js/Pages/School/Inventory/Index.vue
+@@ -214,7 +214,8 @@ const statusLabel  = { available: 'Available', assigned: 'Assigned', under_maint
+ const conditionDot = { excellent: '#10b981', good: '#3b82f6', fair: '#f59e0b', poor: '#ef4444', condemned: '#6b7280' };
+ const maintStatusColor = { open: '#ef4444', in_progress: '#f59e0b', resolved: '#10b981', scrapped: '#94a3b8' };
+ const maintStatusLabel = { open: 'Open', in_progress: 'In Progress', resolved: 'Resolved', scrapped: 'Scrapped' };
+-const fmt     = (d) => d ? new Date(d).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDate: fmt } = useFormat();
+ const fmtCost = (n) => n ? '₹' + Number(n).toLocaleString('en-IN') : '—';
+ const maintTotal = (logs) => logs?.reduce((s, l) => s + parseFloat(l.cost || 0), 0) ?? 0;
+ </script>
+diff --git a/resources/js/Pages/School/Inventory/Reports.vue b/resources/js/Pages/School/Inventory/Reports.vue
+index 6a911c5..2128c93 100644
+--- a/resources/js/Pages/School/Inventory/Reports.vue
++++ b/resources/js/Pages/School/Inventory/Reports.vue
+@@ -30,7 +30,8 @@ const setSort = (key) => {
+     else deprSort.value = { key, dir: 'desc' };
+ };
+ 
+-const fmt     = (d) => d ? new Date(d).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDate: fmt } = useFormat();
+ const fmtCost = (n) => n != null ? '₹' + Number(n).toLocaleString('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: 0 }) : '—';
+ const pct     = (a, b) => b ? Math.round((a / b) * 100) : 0;
+ 
+diff --git a/resources/js/Pages/School/Inventory/Show.vue b/resources/js/Pages/School/Inventory/Show.vue
+index a5fc120..2b8c8aa 100644
+--- a/resources/js/Pages/School/Inventory/Show.vue
++++ b/resources/js/Pages/School/Inventory/Show.vue
+@@ -31,7 +31,8 @@ const conditionDot = { excellent: '#10b981', good: '#3b82f6', fair: '#f59e0b', p
+ const maintStatusColor = { open: '#ef4444', in_progress: '#f59e0b', resolved: '#10b981', scrapped: '#94a3b8' };
+ const maintStatusLabel = { open: 'Open', in_progress: 'In Progress', resolved: 'Resolved', scrapped: 'Scrapped' };
+ 
+-const fmt     = (d) => d ? new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDate: fmt } = useFormat();
+ const fmtCost = (n) => n != null && n !== '' ? '₹' + Number(n).toLocaleString('en-IN') : '—';
+ const pct     = (a, b) => (b && b > 0) ? Math.round((a / b) * 100) : 0;
+ 
+diff --git a/resources/js/Pages/School/Library/Issues.vue b/resources/js/Pages/School/Library/Issues.vue
+index e3e43eb..aaa6954 100644
+--- a/resources/js/Pages/School/Library/Issues.vue
++++ b/resources/js/Pages/School/Library/Issues.vue
+@@ -54,7 +54,8 @@ const markFinePaid = (id) => {
+     router.patch(`/school/library/issues/${id}/fine-paid`, {}, { preserveScroll: true });
+ };
+ 
+-const fmtDate = (d) => d ? new Date(d).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDate: fmtDate } = useFormat();
+ </script>
+ 
+ <template>
+diff --git a/resources/js/Pages/School/PTM/Index.vue b/resources/js/Pages/School/PTM/Index.vue
+index bea2c41..1caed1b 100644
+--- a/resources/js/Pages/School/PTM/Index.vue
++++ b/resources/js/Pages/School/PTM/Index.vue
+@@ -21,7 +21,8 @@ const updateStatus = (id, status) => {
+     router.patch(`/school/ptm/${id}/status`, { status }, { preserveScroll: true });
+ };
+ 
+-const fmt = (d) => d ? new Date(d).toLocaleDateString('en-IN', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDate: fmt } = useFormat();
+ 
+ const statusConfig = {
+     draft:  { label: 'Draft',  color: '#64748b', bg: '#f1f5f9', dot: '#94a3b8' },
+diff --git a/resources/js/Pages/School/PTM/SessionDetail.vue b/resources/js/Pages/School/PTM/SessionDetail.vue
+index 93c4771..4cf45a3 100644
+--- a/resources/js/Pages/School/PTM/SessionDetail.vue
++++ b/resources/js/Pages/School/PTM/SessionDetail.vue
+@@ -3,6 +3,9 @@ import SchoolLayout from '@/Layouts/SchoolLayout.vue';
+ import Button from '@/Components/ui/Button.vue';
+ import { useForm, router, Link } from '@inertiajs/vue3';
+ import { ref, computed } from 'vue';
++import { useFormat } from '@/Composables/useFormat';
++
++const { formatDate: fmt } = useFormat();
+ 
+ const props = defineProps({ session: Object });
+ 
+@@ -44,7 +47,7 @@ const statusBadge = { booked: 'badge-amber', completed: 'badge-green', cancelled
+             <div>
+                 <Link href="/school/ptm" style="font-size:.8rem;color:#94a3b8;">← Back to Sessions</Link>
+                 <h1 class="page-header-title" style="margin-top:4px;">{{ session.title }}</h1>
+-                <div style="font-size:.85rem;color:#64748b;">{{ new Date(session.date).toLocaleDateString('en-IN', { weekday:'long', day:'2-digit', month:'long', year:'numeric' }) }} · {{ session.start_time?.slice(0,5) }}–{{ session.end_time?.slice(0,5) }}</div>
++                <div style="font-size:.85rem;color:#64748b;">{{ fmt(session.date) }} · {{ session.start_time?.slice(0,5) }}–{{ session.end_time?.slice(0,5) }}</div>
+             </div>
+             <span class="badge" :class="{ 'badge-gray': session.status === 'draft', 'badge-green': session.status === 'open', 'badge-amber': session.status === 'closed' }" style="font-size:.9rem;padding:6px 14px;">{{ session.status }}</span>
+         </div>
+diff --git a/resources/js/Pages/School/Quiz/Index.vue b/resources/js/Pages/School/Quiz/Index.vue
+index 10563be..bb305ae 100644
+--- a/resources/js/Pages/School/Quiz/Index.vue
++++ b/resources/js/Pages/School/Quiz/Index.vue
+@@ -11,7 +11,8 @@ const deleteQuiz = (id) => {
+     if (confirm('Delete this quiz?')) router.delete(`/school/quiz/${id}`, { preserveScroll: true });
+ };
+ 
+-const fmt = (d) => d ? new Date(d).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDateTime: fmt } = useFormat();
+ </script>
+ 
+ <template>
+diff --git a/resources/js/Pages/School/Quiz/MyQuizzes.vue b/resources/js/Pages/School/Quiz/MyQuizzes.vue
+index 090a4a8..77a2305 100644
+--- a/resources/js/Pages/School/Quiz/MyQuizzes.vue
++++ b/resources/js/Pages/School/Quiz/MyQuizzes.vue
+@@ -4,7 +4,8 @@ import { Link } from '@inertiajs/vue3';
+ 
+ const props = defineProps({ quizzes: Array });
+ 
+-const fmt = (d) => d ? new Date(d).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDateTime: fmt } = useFormat();
+ 
+ const statusLabel = (q) => {
+     if (q.attempt_status === 'submitted' || q.attempt_status === 'graded') return 'Completed';
+diff --git a/resources/js/Pages/School/Quiz/Results.vue b/resources/js/Pages/School/Quiz/Results.vue
+index 1b474d4..ce65748 100644
+--- a/resources/js/Pages/School/Quiz/Results.vue
++++ b/resources/js/Pages/School/Quiz/Results.vue
+@@ -16,7 +16,8 @@ const passRate = computed(() => {
+     return Math.round(graded.filter(a => a.passed).length / graded.length * 100);
+ });
+ 
+-const fmt = (d) => d ? new Date(d).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDateTime: fmt } = useFormat();
+ </script>
+ 
+ <template>
+diff --git a/resources/js/Pages/School/Setup/RolloverWizard.vue b/resources/js/Pages/School/Setup/RolloverWizard.vue
+index 3693426..56f6744 100644
+--- a/resources/js/Pages/School/Setup/RolloverWizard.vue
++++ b/resources/js/Pages/School/Setup/RolloverWizard.vue
+@@ -4,6 +4,9 @@ import { ref, computed } from 'vue'
+ import { useForm, router } from '@inertiajs/vue3'
+ import SchoolLayout from '@/Layouts/SchoolLayout.vue'
+ import axios from 'axios'
++import { useFormat } from '@/Composables/useFormat';
++
++const { formatDateTime } = useFormat();
+ 
+ const props = defineProps({
+     years:      { type: Array,  default: () => [] },
+@@ -347,7 +350,7 @@ const nextPhaseActionFor = (state) => {
+                         <td>{{ r.id }}</td>
+                         <td>{{ r.source_year?.name }} → {{ r.target_year?.name }}</td>
+                         <td><span class="run-state" :data-state="r.state">{{ phaseLabel(r.state) }}</span></td>
+-                        <td>{{ r.started_at ? new Date(r.started_at).toLocaleString() : '—' }}</td>
++                        <td>{{ formatDateTime(r.started_at) }}</td>
+                         <td>{{ r.started_by?.name || '—' }}</td>
+                         <td><a :href="`/school/settings/rollover/runs/${r.id}`" class="run-link">View</a></td>
+                     </tr>
+diff --git a/resources/js/Pages/School/Staff/History.vue b/resources/js/Pages/School/Staff/History.vue
+index 6b27d23..0194ef5 100644
+--- a/resources/js/Pages/School/Staff/History.vue
++++ b/resources/js/Pages/School/Staff/History.vue
+@@ -46,7 +46,8 @@ const eventTypeColor = {
+     other:               'badge-gray',
+ };
+ 
+-const fmt = (d) => d ? new Date(d).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDate: fmt } = useFormat();
+ const fmtSal = (n) => n ? '₹' + Number(n).toLocaleString('en-IN') : '—';
+ 
+ const needsDesignation = (et) => ['promotion', 'demotion', 'designation_change', 'confirmation'].includes(et);
+diff --git a/resources/js/Pages/School/Staff/HistoryLog.vue b/resources/js/Pages/School/Staff/HistoryLog.vue
+index 8abf094..a254a79 100644
+--- a/resources/js/Pages/School/Staff/HistoryLog.vue
++++ b/resources/js/Pages/School/Staff/HistoryLog.vue
+@@ -35,7 +35,8 @@ const eventTypeColor = {
+     other:               'badge-gray',
+ };
+ 
+-const fmt = (d) => d ? new Date(d).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }) : '—';
++import { useFormat } from '@/Composables/useFormat';
++const { formatDate: fmt } = useFormat();
+ const fmtSal = (n) => n ? '₹' + Number(n).toLocaleString('en-IN') : null;
+ </script>
+ 
+diff --git a/resources/js/Pages/School/Staff/Punch.vue b/resources/js/Pages/School/Staff/Punch.vue
+index 6265570..925257f 100644
+--- a/resources/js/Pages/School/Staff/Punch.vue
++++ b/resources/js/Pages/School/Staff/Punch.vue
+@@ -4,6 +4,9 @@ import { router, usePage } from '@inertiajs/vue3';
+ import SchoolLayout from '@/Layouts/SchoolLayout.vue';
+ import Button from '@/Components/ui/Button.vue';
+ import { useSchoolStore } from '@/stores/useSchoolStore';
++import { useFormat } from '@/Composables/useFormat';
++
++const { formatDate } = useFormat();
+ 
+ const school = useSchoolStore();
+ 
+@@ -31,7 +34,7 @@ const timeStr = computed(() => {
+     const ss = String(t.getSeconds()).padStart(2, '0');
+     return school.fmtTime(`${hh}:${mm}:${ss}`);
+ });
+-const dateStr = computed(() => currentTime.value.toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }));
++const dateStr = computed(() => formatDate(currentTime.value));
+ 
+ // ── Geolocation ─────────────────────────────────────────────
+ const geoStatus = ref('idle');   // idle | loading | success | error | denied
+diff --git a/resources/js/Pages/School/Transport/Attendance/Report.vue b/resources/js/Pages/School/Transport/Attendance/Report.vue
+index 6e1d6b7..e4d4f73 100644
+--- a/resources/js/Pages/School/Transport/Attendance/Report.vue
++++ b/resources/js/Pages/School/Transport/Attendance/Report.vue
+@@ -47,10 +47,8 @@ function tripLabel(type) {
+     return type === 'pickup' ? 'Pickup' : 'Drop';
+ }
+ 
+-function formatDate(d) {
+-    if (!d) return '—';
+-    return new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+-}
++import { useFormat } from '@/Composables/useFormat';
++const { formatDate } = useFormat();
+ </script>
+ 
+ <template>
+-- 
+2.52.0.windows.1
+

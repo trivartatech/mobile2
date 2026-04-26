@@ -11,8 +11,11 @@ Standalone patches for the `school-erp` Laravel API. Apply them on a deployment 
 | `0003-fix-attendance-date-format.patch` | Attendance records rendered raw ISO datetimes like `2026-04-01T18:30:00.000000Z`. Now formats `records[].date` using the school's `date_format` setting from Admin → Settings → System Config. Also adds reusable `School::dateFmt()` / `School::timeFmt()` helpers for future use. |
 | `0004-fix-parent-flow-server.patch` | Three parent-flow fixes: (a) `childList()` returned wrong keys so children showed name only — now returns `class_name`, `section_name`, `admission_number`, `roll_number`, `attendance_pct`. (b) Mobile parent BusTracking screen polled `/api/bus/status` which 404'd — added the route and `MobileApiController::busStatus()` returning running/stopped/idle for the active child's bus. (c) Payment history & receipt now include `payment_date_display` formatted per the admin's `date_format` setting (alongside the existing `payment_date` field for backward compat). |
 | `0005-fix-admission-default-password.patch` | New parent admissions used to get a random unprintable password — admins couldn't tell parents how to log in to the mobile app. Now sets the default password to `parent123` (matches the existing `portal:create-users` artisan command). One-line change to `AdmissionService::admit()`. |
+| `0006-feat-user-management-bulk-actions.patch` | Admin panel User Login Management gets four upgrades: (a) "Create Missing Logins" button auto-creates User rows for any students/parents who don't have one yet (defaults: parent123 / student-DOB). (b) Class + Section filter now also applies to parents (filters by their children's class). (c) Bulk-reset passwords for selected users with one click. (d) Export resulting credentials to Excel or PDF. **Note**: this patch is large (~1k lines) — touches the User Management controller, Vue page, routes, plus a new Excel exporter and PDF blade view. If the other domain has diverged on these files, expect conflicts. |
 
-Patches 1, 2, 4 touch `app/Http/Controllers/Api/MobileApiController.php`. Patch 3 touches the same controller plus `app/Models/School.php`. Patch 4 also adds a route in `routes/api.php`. Patch 5 touches `app/Services/AdmissionService.php`. They apply cleanly in order.
+Patches 1, 2, 4 touch `app/Http/Controllers/Api/MobileApiController.php`. Patch 3 touches the same controller plus `app/Models/School.php`. Patch 4 also adds a route in `routes/api.php`. Patch 5 touches `app/Services/AdmissionService.php`. Patch 6 touches `app/Http/Controllers/School/UserManagementController.php`, `app/Exports/UserCredentialsExport.php` (new), `resources/views/exports/user-credentials.blade.php` (new), `resources/js/Pages/School/Users/Index.vue`, and `routes/web.php`. They apply cleanly in order.
+
+**Patch 6 also requires `npm run build`** on the other server (it modifies a Vue file), unlike the other patches which are pure PHP.
 
 ## How to apply on another live server
 
@@ -25,12 +28,17 @@ curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0002-fix-tea
 curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0003-fix-attendance-date-format.patch -o /tmp/p3.patch
 curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0004-fix-parent-flow-server.patch -o /tmp/p4.patch
 curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0005-fix-admission-default-password.patch -o /tmp/p5.patch
+curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0006-feat-user-management-bulk-actions.patch -o /tmp/p6.patch
 
 # 2. Dry-run — fails loudly if conflicts
-git apply --check /tmp/p1.patch /tmp/p2.patch /tmp/p3.patch /tmp/p4.patch /tmp/p5.patch
+git apply --check /tmp/p1.patch /tmp/p2.patch /tmp/p3.patch /tmp/p4.patch /tmp/p5.patch /tmp/p6.patch
 
 # 3. Apply
-git apply /tmp/p1.patch /tmp/p2.patch /tmp/p3.patch /tmp/p4.patch /tmp/p5.patch
+git apply /tmp/p1.patch /tmp/p2.patch /tmp/p3.patch /tmp/p4.patch /tmp/p5.patch /tmp/p6.patch
+
+# 3b. Patch 6 modified a Vue file — rebuild the frontend bundle
+npm install --no-audit --no-fund
+npm run build
 
 # 4. Reload PHP so OPcache picks up the new code
 php artisan queue:restart

@@ -1,0 +1,42 @@
+From fcddf06dad063815dd80b3861aa5c0068370fc16 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Sun, 26 Apr 2026 21:30:32 +0530
+Subject: [PATCH] =?UTF-8?q?fix:=20student/parent=20attendance=20date=20now?=
+ =?UTF-8?q?=20renders=20(was=20'=E2=80=94'=20on=20mobile)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Attendance.date intentionally has no Eloquent cast (kept raw 'Y-m-d'
+so date = ? lookups don't break, see comment on the model). That meant
+\$r->date was a string, and optional(\$string)->format() returns null
+because strings have no format() method — so the mobile parent &
+student attendance screens received date: null and rendered '—'.
+
+Now parses via Carbon::parse(\$r->date)->format(\$dateFmt) before
+returning. Teacher branch (StaffAttendance) already worked because
+that model has a date cast.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ app/Http/Controllers/Api/MobileApiController.php | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index 2d79363..e8bf132 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -564,7 +564,9 @@ public function attendance(Request $request): JsonResponse
+         return response()->json([
+             'summary'    => $summary,
+             'records'    => $records->map(fn($r) => [
+-                'date'    => optional($r->date)->format($dateFmt),
++                // Attendance.date has no Eloquent cast (kept as raw "Y-m-d" so
++                // WHERE date = … lookups work), so parse before formatting.
++                'date'    => $r->date ? Carbon::parse($r->date)->format($dateFmt) : null,
+                 'status'  => $r->status,
+                 'remarks' => $r->remarks,
+             ]),
+-- 
+2.52.0.windows.1
+

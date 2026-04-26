@@ -1,36 +1,50 @@
-# Timetable fix — backend patch
+# Backend patches for school-erp mobile API
 
-A single backend patch for the school-erp Laravel API. It fixes the mobile teacher/student timetable showing "No classes" on every day.
+Standalone patches for the `school-erp` Laravel API. Apply them on a deployment that needs the fixes without pulling the full `school-erp` history.
 
-## What it changes
+## Patches in this repo
 
-`app/Http/Controllers/Api/MobileApiController.php` — the `timetable()` method now keys the response by lowercase day names (`monday`..`sunday`) instead of the raw `day_of_week` integer (1..7), matching what the mobile app expects.
+| File | What it fixes |
+|------|---------------|
+| `0001-fix-mobile-timetable-empty.patch` | Teacher/student timetable showed "No classes" every day (server keyed schedule by `day_of_week` int instead of lowercase day name). |
+| `0002-fix-teacher-attendance-empty.patch` | Teacher Attendance tab showed 0% with no records (server's `attendance()` had no teacher branch — only resolved student attendance). Adds a `staff_attendances` lookup for teachers. |
 
-12 lines added, 2 lines removed. No migrations, no composer changes, no JS.
+Both touch the same file: `app/Http/Controllers/Api/MobileApiController.php`. They apply cleanly in order.
 
 ## How to apply on another live server
 
 SSH into the server, then from the project root of the school-erp deployment:
 
 ```bash
-# 1. Download the patch
-curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0001-fix-mobile-timetable-empty.patch -o /tmp/timetable-fix.patch
+# 1. Download the patches
+curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0001-fix-mobile-timetable-empty.patch -o /tmp/p1.patch
+curl -L https://raw.githubusercontent.com/trivartatech/mobile2/main/0002-fix-teacher-attendance-empty.patch -o /tmp/p2.patch
 
-# 2. Apply it
-git apply --check /tmp/timetable-fix.patch    # dry run, fails if conflicts
-git apply /tmp/timetable-fix.patch             # actually applies
+# 2. Dry-run — fails loudly if conflicts
+git apply --check /tmp/p1.patch /tmp/p2.patch
 
-# 3. Reload PHP so OPcache picks up the new code
+# 3. Apply
+git apply /tmp/p1.patch /tmp/p2.patch
+
+# 4. Reload PHP so OPcache picks up the new code
 php artisan queue:restart
 sudo systemctl reload php8.3-fpm               # adjust PHP version
 ```
 
-If `git apply --check` complains about conflicts, the file on that server has diverged from the version at commit `10c88ab` of `trivartatech/school-erp`. In that case open the patch file and apply the change by hand — it's small.
+If `git apply --check` reports a conflict, the file on that server has diverged from `trivartatech/school-erp@da600f7`. In that case open the `.patch` file and apply the change by hand — both diffs are short.
 
-## Verify it's live
+## Verify
+
+Log in as a teacher in the mobile app:
+- **Timetable tab** → days with classes should populate (dot indicators appear under those tabs).
+- **Attendance tab** → if the teacher has punched in / been marked at least once this month, % and stats should show; otherwise still empty until punch records exist.
+
+You can also probe the endpoint directly:
 
 ```bash
 curl -H "Authorization: Bearer <teacher_token>" https://<that-domain>/api/mobile/timetable | head -c 200
-```
+# expect: "schedule":{"monday":[...
 
-You should see `"schedule":{"monday":[...` — if it still shows `"schedule":{"1":[...`, OPcache is still serving the old code.
+curl -H "Authorization: Bearer <teacher_token>" https://<that-domain>/api/mobile/attendance | head -c 200
+# expect: "summary":{"present":N,...
+```

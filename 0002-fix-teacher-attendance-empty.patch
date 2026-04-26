@@ -1,0 +1,67 @@
+From da600f7d7b3794702816bb4654c648f6b195a345 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Sun, 26 Apr 2026 14:28:38 +0530
+Subject: [PATCH] =?UTF-8?q?fix:=20mobile=20teacher=20attendance=20empty=20?=
+ =?UTF-8?q?=E2=80=94=20add=20staff=5Fattendances=20branch?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+attendance() previously only handled student lookups; teachers fell
+through to the empty-response path because resolveStudentId() returns
+null for them. Added a teacher branch that queries the user's own
+staff_attendances records, matching the same summary/records shape.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/Api/MobileApiController.php   | 27 +++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index 3eae701..b33e6b5 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -499,6 +499,7 @@ public function children(Request $request): JsonResponse
+     public function attendance(Request $request): JsonResponse
+     {
+         $user   = $request->user();
++        $school = app('current_school');
+         $yearId = app()->bound('current_academic_year_id') ? app('current_academic_year_id') : null;
+         $month  = $request->input('month', now()->format('Y-m'));
+ 
+@@ -506,6 +507,32 @@ public function attendance(Request $request): JsonResponse
+         $from = Carbon::createFromDate((int)$year, (int)$mon, 1)->startOfMonth();
+         $to   = $from->copy()->endOfMonth();
+ 
++        // Teacher view: own staff_attendances records (populated by punch system / admin marking)
++        if ($user->isTeacher() && $user->staff) {
++            $records = StaffAttendance::where('school_id', $school->id)
++                ->where('staff_id', $user->staff->id)
++                ->whereBetween('date', [$from, $to])
++                ->orderBy('date')
++                ->get(['date', 'status', 'remarks']);
++
++            $summary = [
++                'present'  => $records->where('status', 'present')->count(),
++                'absent'   => $records->where('status', 'absent')->count(),
++                'late'     => $records->where('status', 'late')->count(),
++                'half_day' => $records->where('status', 'half_day')->count(),
++                'leave'    => $records->where('status', 'leave')->count(),
++                'total'    => $records->count(),
++            ];
++            $summary['attendance_pct'] = $summary['total'] > 0
++                ? round(($summary['present'] + $summary['late'] * 0.5) / $summary['total'] * 100, 1)
++                : 0;
++
++            return response()->json([
++                'summary' => $summary,
++                'records' => $records,
++            ]);
++        }
++
+         $studentId = $this->resolveStudentId($user, $request);
+         if (!$studentId) {
+             return response()->json(['summary' => [], 'records' => []]);
+-- 
+2.52.0.windows.1
+

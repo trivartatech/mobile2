@@ -1,0 +1,216 @@
+From c1cb8f90f2a56a404ba2c6490f286e3c03aef59f Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Sun, 26 Apr 2026 21:44:41 +0530
+Subject: [PATCH] =?UTF-8?q?feat:=20mobile=20API=20=E2=80=94=20add=20=5Fdis?=
+ =?UTF-8?q?play=20fields=20formatted=20per=20System=20Config?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Sweeps the high-traffic mobile endpoints to include *_display variants
+of the existing date fields, formatted via School::dateFmt(). The raw
+ISO fields are kept as-is for backward compatibility with installed
+app builds that do client-side date math.
+
+Endpoints updated (and the new field names):
+  /mobile/holidays         → date_display, end_date_display
+  /mobile/homework         → due_date_display
+  /mobile/diary            → date_display
+  /mobile/assignments      → due_date_display
+  /mobile/report-cards     → issued_date_display
+  /mobile/leaves           → start_date_display, end_date_display
+  /mobile/staff-leaves     → start_date_display, end_date_display
+
+Already done in earlier commits:
+  /mobile/attendance       → records[].date (formatted)
+  /mobile/payments/history → payment_date_display
+  /mobile/payments/{id}/receipt → payment_date_display
+
+Mobile screens can read the _display fields directly. Existing screens
+keep working with the raw ISO field — they'll just show locale-style
+formatting until they're updated to prefer the _display variant in
+the next mobile build.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/Api/MobileApiController.php   | 96 ++++++++++++-------
+ 1 file changed, 64 insertions(+), 32 deletions(-)
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index e8bf132..31b5a53 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -1701,8 +1701,20 @@ public function leaves(Request $request): JsonResponse
+             'rejected' => $statusCounts['rejected'] ?? 0,
+         ];
+ 
++        // Add _display variants formatted per the school's System Config so
++        // mobile screens can render dates without re-parsing locale-style.
++        $dateFmt = $school->dateFmt();
++        $leavesData = collect($leaves->items())->map(function ($l) use ($dateFmt) {
++            $arr = $l->toArray();
++            $arr['start_date_display'] = $l->start_date instanceof \Carbon\Carbon
++                ? $l->start_date->format($dateFmt) : ($l->start_date ? \Carbon\Carbon::parse($l->start_date)->format($dateFmt) : null);
++            $arr['end_date_display']   = $l->end_date instanceof \Carbon\Carbon
++                ? $l->end_date->format($dateFmt) : ($l->end_date ? \Carbon\Carbon::parse($l->end_date)->format($dateFmt) : null);
++            return $arr;
++        });
++
+         return response()->json([
+-            'leaves'  => $leaves->items(),
++            'leaves'  => $leavesData,
+             'summary' => $summary,
+             'total'   => $leaves->total(),
+             'page'    => $leaves->currentPage(),
+@@ -2390,24 +2402,26 @@ public function homework(Request $request): JsonResponse
+             $query->with(['submissions' => fn($q) => $q->where('student_id', $studentId)]);
+         }
+ 
+-        $assignments = $query->get()->map(function ($a) use ($studentId) {
++        $dateFmt = $school->dateFmt();
++        $assignments = $query->get()->map(function ($a) use ($studentId, $dateFmt) {
+             $submission = $studentId ? $a->submissions->first() : null;
+ 
+             $daysLeft = $a->due_date ? (int) now()->diffInDays($a->due_date, false) : 0;
+ 
+             return [
+-                'id'           => $a->id,
+-                'title'        => $a->title,
+-                'description'  => $a->description,
+-                'subject'      => $a->subject?->name ?? '',
+-                'teacher'      => $a->teacher?->user?->name ?? '',
+-                'due_date'     => $a->due_date?->toDateString(),
+-                'max_marks'    => $a->max_marks,
+-                'days_left'    => $daysLeft,
+-                'is_overdue'   => $daysLeft < 0,
+-                'submitted'    => $submission !== null,
+-                'grade'        => $submission?->marks !== null ? (string) $submission->marks : null,
+-                'has_attachments' => !empty($a->attachments),
++                'id'                => $a->id,
++                'title'             => $a->title,
++                'description'       => $a->description,
++                'subject'           => $a->subject?->name ?? '',
++                'teacher'           => $a->teacher?->user?->name ?? '',
++                'due_date'          => $a->due_date?->toDateString(),
++                'due_date_display'  => $a->due_date?->format($dateFmt),
++                'max_marks'         => $a->max_marks,
++                'days_left'         => $daysLeft,
++                'is_overdue'        => $daysLeft < 0,
++                'submitted'         => $submission !== null,
++                'grade'             => $submission?->marks !== null ? (string) $submission->marks : null,
++                'has_attachments'   => !empty($a->attachments),
+             ];
+         });
+ 
+@@ -2420,16 +2434,19 @@ public function holidays(Request $request): JsonResponse
+     {
+         $school = app('current_school');
+ 
++        $dateFmt  = $school->dateFmt();
+         $holidays = Holiday::where('school_id', $school->id)
+             ->orderBy('date')
+             ->get()
+             ->map(fn($h) => [
+-                'id'          => $h->id,
+-                'name'        => $h->title,
+-                'date'        => $h->date?->toDateString(),
+-                'end_date'    => $h->end_date?->toDateString(),
+-                'type'        => $h->type ?? 'holiday',
+-                'description' => $h->description,
++                'id'               => $h->id,
++                'name'             => $h->title,
++                'date'             => $h->date?->toDateString(),
++                'date_display'     => $h->date?->format($dateFmt),
++                'end_date'         => $h->end_date?->toDateString(),
++                'end_date_display' => $h->end_date?->format($dateFmt),
++                'type'             => $h->type ?? 'holiday',
++                'description'      => $h->description,
+             ]);
+ 
+         return response()->json(['data' => $holidays]);
+@@ -2475,6 +2492,7 @@ public function diary(Request $request): JsonResponse
+             ->selectRaw('diary_id, count(*) as cnt')
+             ->groupBy('diary_id')->pluck('cnt', 'diary_id')->toArray();
+ 
++        $dateFmt = $school->dateFmt();
+         $data = collect($entries->items())->map(fn($d) => [
+             'id'               => $d->id,
+             'subject'          => $d->subject?->name ?? 'General',
+@@ -2485,6 +2503,7 @@ public function diary(Request $request): JsonResponse
+             'completed'        => in_array($d->id, $completions),
+             'completion_count' => $completionCounts[$d->id] ?? 0,
+             'date'             => $d->date?->toDateString(),
++            'date_display'     => $d->date?->format($dateFmt),
+             'created_at'       => $d->created_at?->toIso8601String(),
+         ]);
+ 
+@@ -2584,8 +2603,9 @@ public function assignments(Request $request): JsonResponse
+             : collect();
+ 
+         $today = now()->toDateString();
++        $dateFmt = $school->dateFmt();
+ 
+-        $data = collect($assignments->items())->map(function ($a) use ($submissionsMap, $today) {
++        $data = collect($assignments->items())->map(function ($a) use ($submissionsMap, $today, $dateFmt) {
+             $sub = $submissionsMap->get($a->id);
+             if ($sub) {
+                 $status = $sub->marks !== null ? 'graded' : ($sub->is_late ? 'late' : 'submitted');
+@@ -2595,16 +2615,17 @@ public function assignments(Request $request): JsonResponse
+                 $status = 'pending';
+             }
+             return [
+-                'id'          => $a->id,
+-                'title'       => $a->title,
+-                'description' => $a->description,
+-                'subject'     => $a->subject?->name ?? '',
+-                'teacher'     => $a->teacher?->user?->name ?? '',
+-                'due_date'    => $a->due_date?->toDateString(),
+-                'max_marks'   => $a->max_marks,
+-                'status'      => $status,
+-                'marks'       => $sub?->marks,
+-                'attachments' => $this->absolutizeAttachments($a->attachments ?? []),
++                'id'                => $a->id,
++                'title'             => $a->title,
++                'description'       => $a->description,
++                'subject'           => $a->subject?->name ?? '',
++                'teacher'           => $a->teacher?->user?->name ?? '',
++                'due_date'          => $a->due_date?->toDateString(),
++                'due_date_display'  => $a->due_date?->format($dateFmt),
++                'max_marks'         => $a->max_marks,
++                'status'            => $status,
++                'marks'             => $sub?->marks,
++                'attachments'       => $this->absolutizeAttachments($a->attachments ?? []),
+             ];
+         });
+ 
+@@ -2747,6 +2768,7 @@ public function reportCards(Request $request): JsonResponse
+                 'term_name'           => $schedule->examType?->name ?? 'Exam',
+                 'academic_year'       => $schedule->academicYear?->name ?? '',
+                 'issued_date'         => $schedule->updated_at?->toDateString(),
++                'issued_date_display' => $schedule->updated_at?->format(app('current_school')->dateFmt()),
+                 'overall_percentage'  => $percentage,
+                 'overall_grade'       => $this->calculateGrade($totalObtained, $totalMax),
+                 'rank'                => null,
+@@ -4640,8 +4662,18 @@ public function staffLeaves(Request $request): JsonResponse
+             'rejected' => $statusCounts['rejected'] ?? 0,
+         ];
+ 
++        $dateFmt = $school->dateFmt();
++        $leavesData = collect($leaves->items())->map(function ($l) use ($dateFmt) {
++            $arr = $l->toArray();
++            $arr['start_date_display'] = $l->start_date instanceof \Carbon\Carbon
++                ? $l->start_date->format($dateFmt) : ($l->start_date ? \Carbon\Carbon::parse($l->start_date)->format($dateFmt) : null);
++            $arr['end_date_display']   = $l->end_date instanceof \Carbon\Carbon
++                ? $l->end_date->format($dateFmt) : ($l->end_date ? \Carbon\Carbon::parse($l->end_date)->format($dateFmt) : null);
++            return $arr;
++        });
++
+         return response()->json([
+-            'leaves'  => $leaves->items(),
++            'leaves'  => $leavesData,
+             'summary' => $summary,
+             'total'   => $leaves->total(),
+             'page'    => $leaves->currentPage(),
+-- 
+2.52.0.windows.1
+

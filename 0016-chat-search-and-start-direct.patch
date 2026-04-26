@@ -1,0 +1,128 @@
+From b61e2893ef14ff251dd4432c7d4f3f95dc2e01a2 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Sun, 26 Apr 2026 21:52:26 +0530
+Subject: [PATCH] =?UTF-8?q?feat:=20chat=20=E2=80=94=20search=20users=20+?=
+ =?UTF-8?q?=20start=20direct=20chat=20endpoints?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds two endpoints under /api/v1/* so the mobile app can build a full
+"New Chat" experience instead of being limited to pre-existing
+conversations:
+
+- GET /v1/users/search?q=…&user_type=parent|teacher|student|admin
+  Returns up to 50 users in the same school (excluding self), filtered
+  by name / phone / email and optionally by user_type. Each row has
+  id, name, phone, avatar, user_type, role (display label).
+
+- POST /v1/start-direct-chat { user_id }
+  Resolves to a 1-to-1 ChatConversation by find-or-create using the
+  existing ChatService::findOrCreateDirect(). Returns the
+  conversation_id + display_name so the client can navigate straight
+  into the ChatRoom.
+
+Both routes live in the auth:sanctum + tenant group alongside the
+existing v1 chat endpoints.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/Api/ChatApiController.php     | 68 +++++++++++++++++++
+ routes/api.php                                |  2 +
+ 2 files changed, 70 insertions(+)
+
+diff --git a/app/Http/Controllers/Api/ChatApiController.php b/app/Http/Controllers/Api/ChatApiController.php
+index fd425c8..819bc0c 100644
+--- a/app/Http/Controllers/Api/ChatApiController.php
++++ b/app/Http/Controllers/Api/ChatApiController.php
+@@ -138,6 +138,74 @@ public function syncSection(Request $request)
+         return response()->json(['message' => 'Section group synced.', 'member_count' => count($studentUserIds)]);
+     }
+ 
++    // GET /api/v1/users/search — search users in the school for a new chat
++    public function searchUsers(Request $request)
++    {
++        $request->validate([
++            'q'         => 'nullable|string|max:100',
++            'user_type' => 'nullable|string|max:30',
++        ]);
++
++        $user     = $this->authUser();
++        $schoolId = $user->school_id;
++        $q        = trim((string) $request->input('q', ''));
++        $type     = $request->input('user_type');
++
++        $query = \App\Models\User::where('school_id', $schoolId)
++            ->where('id', '!=', $user->id)
++            ->where('is_active', true)
++            ->select(['id', 'name', 'phone', 'avatar', 'user_type']);
++
++        if ($q !== '') {
++            $query->where(function ($w) use ($q) {
++                $w->where('name', 'like', "%{$q}%")
++                  ->orWhere('phone', 'like', "%{$q}%")
++                  ->orWhere('email', 'like', "%{$q}%");
++            });
++        }
++        if ($type) {
++            $query->where('user_type', $type);
++        }
++
++        $users = $query->orderBy('name')->limit(50)->get()->map(function ($u) {
++            $type = $u->user_type instanceof \BackedEnum ? $u->user_type->value : (string) ($u->user_type ?? '');
++            return [
++                'id'        => $u->id,
++                'name'      => $u->name,
++                'phone'     => $u->phone,
++                'avatar'    => $u->avatar,
++                'user_type' => $type,
++                'role'      => ucfirst(str_replace('_', ' ', $type)),
++            ];
++        });
++
++        return response()->json(['data' => $users]);
++    }
++
++    // POST /api/v1/start-direct-chat — find-or-create a 1-to-1 conversation
++    public function startDirect(Request $request)
++    {
++        $request->validate(['user_id' => 'required|integer|exists:users,id']);
++
++        $user  = $this->authUser();
++        $other = \App\Models\User::where('school_id', $user->school_id)
++            ->where('is_active', true)
++            ->findOrFail($request->user_id);
++
++        if ($other->id === $user->id) {
++            return response()->json(['message' => "You can't chat with yourself."], 422);
++        }
++
++        $conv = $this->chatService->findOrCreateDirect($user, $other, $user->school_id);
++
++        return response()->json([
++            'data' => [
++                'conversation_id' => $conv->id,
++                'display_name'    => $other->name,
++            ],
++        ], 201);
++    }
++
+     // GET /api/v1/chats/{conversation}/poll — for mobile long-polling
+     public function poll(ChatConversation $conversation, Request $request)
+     {
+diff --git a/routes/api.php b/routes/api.php
+index 822d0b2..f393bf6 100644
+--- a/routes/api.php
++++ b/routes/api.php
+@@ -32,6 +32,8 @@
+     Route::post('/create-group',                     [$CA, 'createGroup'])->name('create-group');
+     Route::post('/sync-section',                     [$CA, 'syncSection'])->name('sync-section');
+     Route::get('/chats/{conversation}/poll',         [$CA, 'poll'])->name('chats.poll');
++    Route::get('/users/search',                      [$CA, 'searchUsers'])->name('users.search');
++    Route::post('/start-direct-chat',                [$CA, 'startDirect'])->name('start-direct');
+ });
+ 
+ // GPS Device Update (no auth; secured by device_id lookup)
+-- 
+2.52.0.windows.1
+

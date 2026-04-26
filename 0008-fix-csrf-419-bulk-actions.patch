@@ -1,0 +1,92 @@
+From 9f04580f6ee964121d8846714bfa657f3a4275c7 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Sun, 26 Apr 2026 19:27:54 +0530
+Subject: [PATCH] =?UTF-8?q?fix:=20CSRF=20419=20=E2=80=94=20read=20token=20?=
+ =?UTF-8?q?from=20XSRF-TOKEN=20cookie,=20not=20Inertia=20prop?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Bulk reset / create missing / export endpoints were 419'ing because
+usePage().props.csrf_token is undefined — HandleInertiaRequests doesn't
+share csrf_token as a prop in this app. The fetch calls were sending
+'X-CSRF-TOKEN: undefined'.
+
+The pre-existing per-row Reset button had the same bug, just hadn't
+been exercised recently.
+
+Now reads the XSRF-TOKEN cookie directly (same source axios uses) and
+sends it as X-XSRF-TOKEN. The cookie is rotated by Laravel on session
+changes so it's always fresh, unlike the <meta name=csrf-token> tag
+which is static once rendered.
+
+Verified in preview: bulk-reset endpoint now returns 401 (auth
+required) instead of 419 (CSRF mismatch) when called with the new
+header — i.e., the CSRF middleware is now satisfied.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ resources/js/Pages/School/Users/Index.vue | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/resources/js/Pages/School/Users/Index.vue b/resources/js/Pages/School/Users/Index.vue
+index 1d8e44e..27036d1 100644
+--- a/resources/js/Pages/School/Users/Index.vue
++++ b/resources/js/Pages/School/Users/Index.vue
+@@ -10,6 +10,17 @@ import { usePermissions } from '@/Composables/usePermissions';
+ const toast = useToast();
+ const { can } = usePermissions();
+ 
++// CSRF — Laravel sets the `XSRF-TOKEN` cookie and rotates it on session
++// changes. The meta tag is set once on first render and goes stale on
++// long-lived pages. Reading the cookie + sending as X-XSRF-TOKEN is what
++// axios does automatically; we replicate it here for our fetch() calls.
++const csrfHeader = () => {
++    const m = document.cookie.match(/(?:^|; )XSRF-TOKEN=([^;]+)/);
++    return m
++        ? { 'X-XSRF-TOKEN': decodeURIComponent(m[1]) }
++        : { 'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') ?? '' };
++};
++
+ const props = defineProps({
+     users:           Object,
+     filters:         Object,
+@@ -73,7 +84,7 @@ const handleResetPassword = async (user) => {
+     try {
+         const response = await fetch(`/school/users/${user.id}/reset-password`, {
+             method: 'POST',
+-            headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': usePage().props.csrf_token },
++            headers: { 'Content-Type': 'application/json', ...csrfHeader() },
+         });
+         const result = await response.json();
+         if (result.success) {
+@@ -119,7 +130,7 @@ const createMissing = async (type) => {
+     try {
+         const res = await fetch('/school/users/create-missing', {
+             method: 'POST',
+-            headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': usePage().props.csrf_token },
++            headers: { 'Content-Type': 'application/json', ...csrfHeader() },
+             body: JSON.stringify({ type }),
+         });
+         const result = await res.json();
+@@ -146,7 +157,7 @@ const bulkReset = async () => {
+     try {
+         const res = await fetch('/school/users/bulk-reset', {
+             method: 'POST',
+-            headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': usePage().props.csrf_token },
++            headers: { 'Content-Type': 'application/json', ...csrfHeader() },
+             body: JSON.stringify({ user_ids: ids }),
+         });
+         const result = await res.json();
+@@ -167,7 +178,7 @@ const exportCredentials = async (format) => {
+     if (bulkRows.value.length === 0) return;
+     const res = await fetch('/school/users/export-credentials', {
+         method: 'POST',
+-        headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': usePage().props.csrf_token },
++        headers: { 'Content-Type': 'application/json', ...csrfHeader() },
+         body: JSON.stringify({ rows: bulkRows.value, format }),
+     });
+     if (!res.ok) { toast.error('Export failed.'); return; }
+-- 
+2.52.0.windows.1
+

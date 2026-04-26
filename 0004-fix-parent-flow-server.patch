@@ -1,0 +1,232 @@
+From 257c756e80ae7375be97a951515fc9aad4af3011 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Sun, 26 Apr 2026 14:43:37 +0530
+Subject: [PATCH] =?UTF-8?q?fix:=20parent=20flow=20=E2=80=94=20childList=20?=
+ =?UTF-8?q?schema,=20/bus/status=20route,=20payment=20date=20format?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three backend fixes for the mobile parent flow:
+
+1. childList() returned wrong keys ('class', 'section', 'admission_no')
+   so DashboardScreen and ChildrenScreen showed children with name only.
+   Now returns class_name, section_name, admission_number, roll_number,
+   plus per-child attendance_pct for the current academic year.
+
+2. Mobile parent BusTrackingScreen polled /api/bus/status every 15 s
+   but no such route existed — it 404'd silently and the screen was
+   stuck on "Bus not started" forever. Added MobileApiController::busStatus
+   and /api/bus/status route (auth'd, outside /mobile prefix to match
+   the existing screen's URL). Returns running/stopped/idle plus driver
+   name, route name, and live coordinates derived from the active child's
+   transport allocation.
+
+3. Payment dates in /mobile/payments/history and /mobile/payments/{id}/receipt
+   now include payment_date_display formatted per the school's System
+   Config date_format setting. payment_date kept unchanged for backward
+   compat with installed app builds.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/Api/MobileApiController.php   | 133 ++++++++++++++----
+ routes/api.php                                |   8 ++
+ 2 files changed, 114 insertions(+), 27 deletions(-)
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index b6195c4..2d79363 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -695,6 +695,67 @@ public function timetable(Request $request): JsonResponse
+ 
+     // ── Transport ─────────────────────────────────────────────────────────────
+ 
++    /**
++     * Live bus status for the current parent's active child (or student themselves).
++     * Polled every 15 s by the mobile parent BusTracking screen.
++     */
++    public function busStatus(Request $request): JsonResponse
++    {
++        $user = $request->user();
++
++        $studentId = $this->resolveStudentId($user, $request);
++        if (!$studentId) {
++            return response()->json(['status' => 'idle']);
++        }
++
++        $alloc = TransportStudentAllocation::where('student_id', $studentId)
++            ->where('status', 'active')
++            ->with([
++                'vehicle.liveLocation',
++                'vehicle.route:id,route_name',
++                'vehicle.driver:id,user_id',
++                'vehicle.driver.user:id,name',
++            ])
++            ->first();
++
++        if (!$alloc || !$alloc->vehicle) {
++            return response()->json(['status' => 'idle']);
++        }
++
++        $vehicle    = $alloc->vehicle;
++        $live       = $vehicle->liveLocation;
++        $driverName = $vehicle->driver?->user?->name;
++        $routeName  = $vehicle->route?->route_name;
++
++        if (!$live) {
++            return response()->json([
++                'status'      => 'idle',
++                'driver_name' => $driverName,
++                'route_name'  => $routeName,
++            ]);
++        }
++
++        // The driver-tracking endpoint stops a trip by setting updated_at to 10 min ago.
++        // Treat anything within 5 min as live; 5–30 min as recently stopped; older as idle.
++        $minutesAgo = (int) $live->updated_at->diffInMinutes(now());
++        if ($minutesAgo <= 5) {
++            $status = 'running';
++        } elseif ($minutesAgo <= 30) {
++            $status = 'stopped';
++        } else {
++            $status = 'idle';
++        }
++
++        return response()->json([
++            'status'      => $status,
++            'driver_name' => $driverName,
++            'route_name'  => $routeName,
++            'latitude'    => $live->latitude,
++            'longitude'   => $live->longitude,
++            'stopped_at'  => $status === 'stopped' ? $live->updated_at?->toIso8601String() : null,
++        ]);
++    }
++
+     public function transport(Request $request): JsonResponse
+     {
+         $user   = $request->user();
+@@ -1148,17 +1209,32 @@ private function childList($user): array
+         $parent = $user->studentParent;
+         if (!$parent) return [];
+ 
++        $yearId = app()->bound('current_academic_year_id') ? app('current_academic_year_id') : null;
++
+         return $parent->students()
+             ->with(['currentAcademicHistory.courseClass', 'currentAcademicHistory.section'])
+             ->get()
+-            ->map(fn($s) => [
+-                'id'           => $s->id,
+-                'name'         => $s->name,
+-                'admission_no' => $s->admission_no,
+-                'photo_url'    => $s->photo_url,
+-                'class'        => $s->currentAcademicHistory?->courseClass?->name ?? '',
+-                'section'      => $s->currentAcademicHistory?->section?->name ?? '',
+-            ])
++            ->map(function ($s) use ($yearId) {
++                // Per-child attendance % for the current academic year
++                $attPct = null;
++                if ($yearId) {
++                    $tot  = Attendance::where('student_id', $s->id)->where('academic_year_id', $yearId)->count();
++                    $pres = $tot > 0 ? Attendance::where('student_id', $s->id)->where('academic_year_id', $yearId)
++                        ->whereIn('status', ['present', 'late'])->count() : 0;
++                    $attPct = $tot > 0 ? round($pres / $tot * 100) : null;
++                }
++
++                return [
++                    'id'               => $s->id,
++                    'name'             => $s->name,
++                    'admission_number' => $s->admission_no,
++                    'roll_number'      => $s->roll_no,
++                    'photo_url'        => $s->photo_url,
++                    'class_name'       => $s->currentAcademicHistory?->courseClass?->name ?? '',
++                    'section_name'     => $s->currentAcademicHistory?->section?->name ?? '',
++                    'attendance_pct'   => $attPct,
++                ];
++            })
+             ->toArray();
+     }
+ 
+@@ -2939,7 +3015,8 @@ public function paymentHistory(Request $request): JsonResponse
+             ->orderByDesc('created_at')
+             ->paginate(20, ['*'], 'page', $page);
+ 
+-        $data = collect($payments->items())->map(function ($p) {
++        $dateFmt = $school->dateFmt();
++        $data = collect($payments->items())->map(function ($p) use ($dateFmt) {
+             $mode = $p->payment_mode instanceof \BackedEnum
+                 ? $p->payment_mode->value
+                 : $p->payment_mode;
+@@ -2948,20 +3025,21 @@ public function paymentHistory(Request $request): JsonResponse
+                 : $p->status;
+ 
+             return [
+-                'id'              => $p->id,
+-                'receipt_no'      => $p->receipt_no,
+-                'fee_head'        => $p->feeHead?->name ?? 'Other',
+-                'term'            => $p->term,
+-                'amount'          => (float) $p->amount_paid,
+-                'amount_paid'     => (float) $p->amount_paid,
+-                'balance'         => (float) ($p->balance ?? 0),
+-                'payment_date'    => $p->payment_date?->toDateString(),
+-                'payment_mode'    => $mode,
+-                'status'          => strtolower((string) ($status ?? 'pending')),
+-                'transaction_id'  => $p->transaction_ref ?: $p->receipt_no,
+-                'transaction_ref' => $p->transaction_ref,
+-                'created_at'      => $p->created_at?->toIso8601String(),
+-                'has_receipt'     => !empty($p->receipt_no),
++                'id'                   => $p->id,
++                'receipt_no'           => $p->receipt_no,
++                'fee_head'             => $p->feeHead?->name ?? 'Other',
++                'term'                 => $p->term,
++                'amount'               => (float) $p->amount_paid,
++                'amount_paid'          => (float) $p->amount_paid,
++                'balance'              => (float) ($p->balance ?? 0),
++                'payment_date'         => $p->payment_date?->toDateString(),
++                'payment_date_display' => $p->payment_date?->format($dateFmt),
++                'payment_mode'         => $mode,
++                'status'               => strtolower((string) ($status ?? 'pending')),
++                'transaction_id'       => $p->transaction_ref ?: $p->receipt_no,
++                'transaction_ref'      => $p->transaction_ref,
++                'created_at'           => $p->created_at?->toIso8601String(),
++                'has_receipt'          => !empty($p->receipt_no),
+             ];
+         });
+ 
+@@ -3014,10 +3092,11 @@ public function paymentReceipt(Request $request, int $id): JsonResponse
+                 'logo_url' => $this->publicFileUrl($school->logo),
+             ],
+             'payment' => [
+-                'id'              => $payment->id,
+-                'receipt_no'      => $payment->receipt_no,
+-                'payment_date'    => $payment->payment_date?->toDateString(),
+-                'payment_mode'    => strtoupper($mode ?? ''),
++                'id'                   => $payment->id,
++                'receipt_no'           => $payment->receipt_no,
++                'payment_date'         => $payment->payment_date?->toDateString(),
++                'payment_date_display' => $payment->payment_date?->format($school->dateFmt()),
++                'payment_mode'         => strtoupper($mode ?? ''),
+                 'transaction_ref' => $payment->transaction_ref,
+                 'fee_head'        => $payment->feeHead?->name ?? 'Other',
+                 'fee_group'       => $payment->feeHead?->feeGroup?->name ?? '',
+diff --git a/routes/api.php b/routes/api.php
+index 99c55a5..822d0b2 100644
+--- a/routes/api.php
++++ b/routes/api.php
+@@ -82,6 +82,14 @@
+     ->middleware('throttle:10,1')
+     ->name('api.login');
+ 
++// Bus status — auth'd but outside the /mobile prefix because the mobile app
++// polls /api/bus/status directly. Returns the live state of the parent's
++// active child's bus (or own bus for students).
++Route::middleware(['auth:sanctum', 'tenant'])->group(function () {
++    Route::get('/bus/status', [\App\Http\Controllers\Api\MobileApiController::class, 'busStatus'])
++        ->name('api.bus.status');
++});
++
+ // Authenticated mobile routes
+ Route::middleware(['auth:sanctum', 'tenant'])->prefix('mobile')->group(function () {
+     $MA = MobileApiController::class;
+-- 
+2.52.0.windows.1
+

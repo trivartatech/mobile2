@@ -1,0 +1,511 @@
+From 6d5f30e7140481b85367aaf153ca342494d4a3fd Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 13:43:23 +0530
+Subject: [PATCH] feat: staff QR badge exports + in-app QR display
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three additions covering the printing and the on-phone display side
+of staff QR attendance.
+
+WEB — bulk badge generation
+  • New app/Exports/StaffQRExport.php — Excel sheet with embedded PNG
+    QR codes per staff (mirrors StudentQRExport).
+  • New PDF print sheet at resources/views/exports/staff-badges.blade.php
+    — 8 badges per A4 page, each with school header, staff name,
+    designation, department, employee_id pill, phone, and a 26mm QR
+    on the right.
+  • StaffController gets exportQrCodesExcel() and exportQrCodesPdf().
+  • Routes added BEFORE Route::resource('staff', ...) so 'qr-codes' is
+    not eaten by the {staff} route binding:
+      GET /school/staff/qr-codes/excel
+      GET /school/staff/qr-codes/pdf
+  • Two new buttons in Pages/School/Staff/Index.vue header:
+      "QR Badges PDF"  → print-ready
+      "QR Excel"       → spreadsheet with embedded QRs
+
+  All QRs encode url('/q/staff/<employee_id>') — the same shape the
+  mobile rapid-scan endpoint accepts via its /staff/<id> regex.
+
+MOBILE — in-app QR display
+  • New endpoint GET /api/mobile/staff-qr/me returns the current
+    staff member's QR as a base64 PNG data URI plus name, designation,
+    department, employee_id, school name, and the encoded URL.
+  • Generated server-side via Endroid\QrCode (already installed for
+    student QRs). No new client-side dep needed.
+  • New screen src/screens/staff/MyQrScreen.js — displays the QR card
+    with the staff's details. Caches the response in AsyncStorage so
+    the QR is shown instantly on next open and works offline.
+  • Wired into both AdminNavigator and TeacherNavigator as a "My QR"
+    tab (qr-code-outline icon). Lives next to "My Punch".
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ app/Exports/StaffQRExport.php                 | 139 ++++++++++++++++++
+ .../Controllers/Api/MobileApiController.php   |  46 ++++++
+ .../Controllers/School/StaffController.php    |  63 ++++++++
+ resources/js/Pages/School/Staff/Index.vue     |  11 +-
+ .../views/exports/staff-badges.blade.php      | 118 +++++++++++++++
+ routes/api.php                                |   1 +
+ routes/web.php                                |   4 +
+ 7 files changed, 381 insertions(+), 1 deletion(-)
+ create mode 100644 app/Exports/StaffQRExport.php
+ create mode 100644 resources/views/exports/staff-badges.blade.php
+
+diff --git a/app/Exports/StaffQRExport.php b/app/Exports/StaffQRExport.php
+new file mode 100644
+index 0000000..618b1f8
+--- /dev/null
++++ b/app/Exports/StaffQRExport.php
+@@ -0,0 +1,139 @@
++<?php
++
++namespace App\Exports;
++
++use App\Models\Staff;
++use Endroid\QrCode\QrCode;
++use Endroid\QrCode\Writer\PngWriter;
++use Maatwebsite\Excel\Concerns\FromCollection;
++use Maatwebsite\Excel\Concerns\ShouldAutoSize;
++use Maatwebsite\Excel\Concerns\WithEvents;
++use Maatwebsite\Excel\Concerns\WithHeadings;
++use Maatwebsite\Excel\Concerns\WithMapping;
++use Maatwebsite\Excel\Concerns\WithStyles;
++use Maatwebsite\Excel\Events\AfterSheet;
++use PhpOffice\PhpSpreadsheet\Worksheet\Drawing;
++use PhpOffice\PhpSpreadsheet\Worksheet\Worksheet;
++
++/**
++ * Excel export of every active staff member with their QR code embedded as
++ * a PNG image in column F. Mirrors StudentQRExport. Each QR encodes the
++ * "/q/staff/<employee_id>" URL — same shape the mobile rapid-scan handler
++ * unwraps via its /staff/<id> regex.
++ */
++class StaffQRExport implements FromCollection, WithHeadings, WithMapping, ShouldAutoSize, WithStyles, WithEvents
++{
++    protected int $schoolId;
++    protected ?int $departmentId;
++    protected $staffList;
++    protected array $tempFiles = [];
++
++    public function __construct(int $schoolId, ?int $departmentId = null)
++    {
++        $this->schoolId     = $schoolId;
++        $this->departmentId = $departmentId;
++    }
++
++    public function collection()
++    {
++        $query = Staff::with(['user:id,name,phone,email', 'designation:id,name', 'department:id,name'])
++            ->where('school_id', $this->schoolId)
++            ->where('status', 'active')
++            ->whereNotNull('employee_id');
++
++        if ($this->departmentId) {
++            $query->where('department_id', $this->departmentId);
++        }
++
++        $this->staffList = $query
++            ->orderBy('employee_id')
++            ->get();
++
++        return $this->staffList;
++    }
++
++    public function headings(): array
++    {
++        return [
++            'Employee ID',
++            'Name',
++            'Designation',
++            'Department',
++            'Phone',
++            'QR Code',          // F — embedded image
++            'Scan URL',
++        ];
++    }
++
++    public function map($staff): array
++    {
++        return [
++            $staff->employee_id,
++            $staff->user?->name ?? '—',
++            $staff->designation?->name ?? '—',
++            $staff->department?->name ?? '—',
++            $staff->user?->phone ?? '—',
++            '',                                            // QR placeholder
++            url('/q/staff/' . $staff->employee_id),
++        ];
++    }
++
++    public function styles(Worksheet $sheet)
++    {
++        return [
++            1 => [
++                'font' => ['bold' => true, 'color' => ['argb' => 'FFFFFFFF']],
++                'fill' => [
++                    'fillType'   => \PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID,
++                    'startColor' => ['argb' => 'FF1565C0'],
++                ],
++            ],
++        ];
++    }
++
++    public function registerEvents(): array
++    {
++        return [
++            AfterSheet::class => function (AfterSheet $event) {
++                $sheet = $event->sheet->getDelegate();
++                $sheet->getColumnDimension('F')->setWidth(18);
++
++                $writer  = new PngWriter();
++                $rowIndex = 2;
++
++                foreach ($this->staffList as $staff) {
++                    $sheet->getRowDimension($rowIndex)->setRowHeight(100);
++
++                    $url = url('/q/staff/' . $staff->employee_id);
++
++                    $qrCode = new QrCode($url);
++                    $qrCode->setSize(280);
++                    $qrCode->setMargin(6);
++
++                    $result  = $writer->write($qrCode);
++                    $tmpPath = sys_get_temp_dir() . '/staff_qr_' . $staff->employee_id . '_' . uniqid() . '.png';
++                    file_put_contents($tmpPath, $result->getString());
++                    $this->tempFiles[] = $tmpPath;
++
++                    $drawing = new Drawing();
++                    $drawing->setName('QR_' . $staff->employee_id);
++                    $drawing->setDescription('Staff QR Code');
++                    $drawing->setPath($tmpPath);
++                    $drawing->setHeight(95);
++                    $drawing->setOffsetX(4);
++                    $drawing->setOffsetY(3);
++                    $drawing->setCoordinates('F' . $rowIndex);
++                    $drawing->setWorksheet($sheet);
++
++                    $rowIndex++;
++                }
++
++                register_shutdown_function(function () {
++                    foreach ($this->tempFiles as $file) {
++                        if (file_exists($file)) @unlink($file);
++                    }
++                });
++            },
++        ];
++    }
++}
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index af5e8eb..47bb80d 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -3703,6 +3703,52 @@ public function rapidScanAttendance(Request $request): JsonResponse
+         ]);
+     }
+ 
++    /**
++     * GET /mobile/staff-qr/me
++     * Returns the current staff member's QR code as a base64 PNG data URI,
++     * so the mobile app can render <Image source={{ uri: data_uri }} />
++     * without needing a QR-generation library on the client.
++     *
++     * The QR encodes the same /q/staff/<employee_id> URL the bulk PDF/Excel
++     * exports use — so a phone-shown QR is interchangeable with a printed
++     * badge at the scanner end.
++     */
++    public function staffQrSelf(Request $request): JsonResponse
++    {
++        $user   = $request->user();
++        $school = app('current_school');
++
++        $staff = \App\Models\Staff::with('designation:id,name', 'department:id,name')
++            ->where('user_id', $user->id)
++            ->where('school_id', $school->id)
++            ->where('status', 'active')
++            ->first();
++
++        if (!$staff) {
++            return response()->json(['message' => 'No active staff record found.'], 404);
++        }
++        if (!$staff->employee_id) {
++            return response()->json(['message' => 'Your record has no Employee ID — ask admin.'], 422);
++        }
++
++        $url    = url('/q/staff/' . $staff->employee_id);
++        $qr     = new \Endroid\QrCode\QrCode($url);
++        $qr->setSize(360);
++        $qr->setMargin(8);
++        $writer = new \Endroid\QrCode\Writer\PngWriter();
++        $png    = $writer->write($qr)->getString();
++
++        return response()->json([
++            'data_uri'    => 'data:image/png;base64,' . base64_encode($png),
++            'employee_id' => $staff->employee_id,
++            'name'        => $user->name,
++            'designation' => $staff->designation?->name,
++            'department'  => $staff->department?->name,
++            'school_name' => $school->name,
++            'scan_url'    => $url,
++        ]);
++    }
++
+     /**
+      * POST /mobile/staff-attendance/rapid-scan
+      * Mirrors the student rapid-scan flow for staff. Admin / principal /
+diff --git a/app/Http/Controllers/School/StaffController.php b/app/Http/Controllers/School/StaffController.php
+index 01ca401..40ab11b 100644
+--- a/app/Http/Controllers/School/StaffController.php
++++ b/app/Http/Controllers/School/StaffController.php
+@@ -289,6 +289,69 @@ public function update(Request $request, Staff $staff)
+         return redirect()->route('school.staff.index')->with('success', 'Staff member updated successfully.');
+     }
+ 
++    /**
++     * GET /school/staff/qr-codes/excel
++     * Bulk export of every active staff member with embedded QR codes.
++     */
++    public function exportQrCodesExcel(Request $request)
++    {
++        $schoolId     = app('current_school_id');
++        $departmentId = $request->integer('department_id') ?: null;
++
++        $fileName = 'Staff_QRs_' . date('Y_m_d_His') . '.xlsx';
++
++        return \Maatwebsite\Excel\Facades\Excel::download(
++            new \App\Exports\StaffQRExport($schoolId, $departmentId),
++            $fileName
++        );
++    }
++
++    /**
++     * GET /school/staff/qr-codes/pdf
++     * Print-ready PDF — 8 badges per A4 page, each with name, designation,
++     * employee ID and a 26mm QR linking to /q/staff/<employee_id>.
++     */
++    public function exportQrCodesPdf(Request $request)
++    {
++        $schoolId     = app('current_school_id');
++        $departmentId = $request->integer('department_id') ?: null;
++        $school       = app('current_school');
++
++        $staffList = Staff::with(['user:id,name,phone', 'designation:id,name', 'department:id,name'])
++            ->where('school_id', $schoolId)
++            ->where('status', 'active')
++            ->whereNotNull('employee_id')
++            ->when($departmentId, fn($q) => $q->where('department_id', $departmentId))
++            ->orderBy('employee_id')
++            ->get();
++
++        $writer = new \Endroid\QrCode\Writer\PngWriter();
++        $rows = $staffList->map(function ($s) use ($writer) {
++            $url = url('/q/staff/' . $s->employee_id);
++            $qr  = new \Endroid\QrCode\QrCode($url);
++            $qr->setSize(280);
++            $qr->setMargin(6);
++            $png = $writer->write($qr)->getString();
++            return [
++                'employee_id' => $s->employee_id,
++                'name'        => $s->user?->name ?? '—',
++                'designation' => $s->designation?->name ?? '—',
++                'department'  => $s->department?->name,
++                'phone'       => $s->user?->phone,
++                'qr_data_uri' => 'data:image/png;base64,' . base64_encode($png),
++            ];
++        })->all();
++
++        $pdf = \Barryvdh\DomPDF\Facade\Pdf::loadView('exports.staff-badges', [
++            'rows'    => $rows,
++            'school'  => $school,
++            'title'   => ($school?->name ?? 'School') . ' — Staff Badges',
++            'printed' => now()->format('d M Y, h:i A'),
++        ])->setPaper('a4', 'portrait');
++
++        return $pdf->download('staff-badges-' . now()->format('Y-m-d_His') . '.pdf');
++    }
++
+     public function destroy(Staff $staff)
+     {
+         abort_if($staff->school_id !== app('current_school_id'), 403);
+diff --git a/resources/js/Pages/School/Staff/Index.vue b/resources/js/Pages/School/Staff/Index.vue
+index 46ea695..bc07889 100644
+--- a/resources/js/Pages/School/Staff/Index.vue
++++ b/resources/js/Pages/School/Staff/Index.vue
+@@ -43,11 +43,20 @@ const deleteStaff = (id, name) => del(`/school/staff/${id}`, `Delete staff membe
+                 <h1 class="page-header-title">Staff Directory</h1>
+                 <p class="page-header-sub">Manage all school employees and their information</p>
+             </div>
+-            <div style="display:flex;align-items:center;gap:8px;">
++            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                 <ExportDropdown
+                     base-url="/school/export/staff"
+                     :params="{ search: filters.search, status: filters.status }"
+                 />
++                <!-- Staff QR badges — print/sheet for the whole roster -->
++                <Button variant="secondary" size="sm" as="a" href="/school/staff/qr-codes/pdf" target="_blank">
++                    <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m0 14v1m8-9h-1M5 12H4m11.314-6.314l-.707.707M6.393 17.607l-.707.707M17.607 17.607l-.707-.707M6.393 6.393l-.707-.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"/></svg>
++                    QR Badges PDF
++                </Button>
++                <Button variant="secondary" size="sm" as="a" href="/school/staff/qr-codes/excel">
++                    <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
++                    QR Excel
++                </Button>
+                 <Button variant="secondary" size="sm" as="link" v-if="canDo('create', 'staff')" href="/school/bulk-import?type=staff">
+                     <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+                     Bulk Import
+diff --git a/resources/views/exports/staff-badges.blade.php b/resources/views/exports/staff-badges.blade.php
+new file mode 100644
+index 0000000..d173b8f
+--- /dev/null
++++ b/resources/views/exports/staff-badges.blade.php
+@@ -0,0 +1,118 @@
++<!DOCTYPE html>
++<html>
++<head>
++<meta charset="utf-8">
++<title>{{ $title }}</title>
++<style>
++    @page { margin: 10mm; }
++    * { box-sizing: border-box; }
++    body { font-family: DejaVu Sans, sans-serif; color: #1A237E; margin: 0; padding: 0; }
++
++    .header {
++        text-align: center; padding: 6mm 0 4mm; border-bottom: 1.5px solid #1565C0;
++        margin-bottom: 6mm;
++    }
++    .header-school { font-size: 14pt; font-weight: 800; }
++    .header-meta   { font-size: 9pt; color: #607D8B; margin-top: 2mm; }
++
++    /* 2 columns × 4 rows = 8 badges per A4 page */
++    .grid { width: 100%; }
++    .grid td {
++        width: 50%; padding: 3mm; vertical-align: top;
++    }
++
++    .badge {
++        border: 1.5px solid #1565C0; border-radius: 6px;
++        padding: 4mm; height: 55mm;
++        background: #fff;
++    }
++    .badge-top {
++        border-bottom: 1px dashed #BBDEFB; padding-bottom: 2mm; margin-bottom: 3mm;
++    }
++    .badge-school { font-size: 9pt; font-weight: 700; color: #1565C0; }
++    .badge-tag    { font-size: 6pt; color: #90A4AE; letter-spacing: 1px; text-transform: uppercase; }
++
++    .badge-row { width: 100%; }
++    .badge-row td { vertical-align: top; padding: 0; }
++    .badge-info-cell { width: 60%; padding-right: 3mm !important; }
++    .badge-qr-cell   { width: 40%; text-align: right; }
++    .badge-qr-cell img { width: 26mm; height: 26mm; }
++
++    .badge-name        { font-size: 11pt; font-weight: 800; color: #1A237E; }
++    .badge-designation { font-size: 8pt; color: #455A64; margin-top: 1.5mm; }
++    .badge-department  { font-size: 7.5pt; color: #78909C; margin-top: 1mm; }
++    .badge-empid {
++        font-size: 7pt; font-weight: 700; color: #1565C0;
++        background: #E3F2FD; display: inline-block;
++        padding: 1mm 2.5mm; border-radius: 2mm; margin-top: 2mm;
++        font-family: DejaVu Sans Mono, monospace;
++    }
++    .badge-phone { font-size: 7pt; color: #90A4AE; margin-top: 2mm; }
++
++    .footer-strip {
++        margin-top: 2mm; padding-top: 1.5mm;
++        border-top: 1px dashed #ECEFF1;
++        font-size: 6.5pt; color: #B0BEC5; text-align: center;
++    }
++
++    /* Force a page break every 8 badges so each page starts fresh */
++    .pagebreak { page-break-after: always; }
++</style>
++</head>
++<body>
++
++<div class="header">
++    <div class="header-school">{{ $school?->name ?? 'School' }}</div>
++    <div class="header-meta">Staff Identification Badges &nbsp;·&nbsp; Generated {{ $printed }} &nbsp;·&nbsp; {{ count($rows) }} badge{{ count($rows) === 1 ? '' : 's' }}</div>
++</div>
++
++@php $cells = collect($rows)->chunk(2); @endphp
++
++<table class="grid" cellpadding="0" cellspacing="0">
++@foreach ($cells->chunk(4) as $pageIndex => $page)
++    @foreach ($page as $row)
++        <tr>
++        @foreach ($row as $r)
++            <td>
++                <div class="badge">
++                    <div class="badge-top">
++                        <div class="badge-school">{{ $school?->name ?? 'School' }}</div>
++                        <div class="badge-tag">Staff ID</div>
++                    </div>
++                    <table class="badge-row" cellpadding="0" cellspacing="0">
++                        <tr>
++                            <td class="badge-info-cell">
++                                <div class="badge-name">{{ $r['name'] ?? '—' }}</div>
++                                <div class="badge-designation">{{ $r['designation'] ?? '—' }}</div>
++                                @if (!empty($r['department']))
++                                    <div class="badge-department">{{ $r['department'] }}</div>
++                                @endif
++                                <div class="badge-empid">{{ $r['employee_id'] ?? '—' }}</div>
++                                @if (!empty($r['phone']))
++                                    <div class="badge-phone">{{ $r['phone'] }}</div>
++                                @endif
++                            </td>
++                            <td class="badge-qr-cell">
++                                @if (!empty($r['qr_data_uri']))
++                                    <img src="{{ $r['qr_data_uri'] }}" />
++                                @endif
++                            </td>
++                        </tr>
++                    </table>
++                    <div class="footer-strip">Scan to mark attendance</div>
++                </div>
++            </td>
++        @endforeach
++        @if ($row->count() === 1)
++            <td></td>
++        @endif
++        </tr>
++    @endforeach
++    @if (!$loop->last)
++        <tr><td colspan="2" class="pagebreak"></td></tr>
++    @endif
++@endforeach
++</table>
++
++</body>
++</html>
+diff --git a/routes/api.php b/routes/api.php
+index 04c222a..ff1419b 100644
+--- a/routes/api.php
++++ b/routes/api.php
+@@ -224,6 +224,7 @@
+     Route::get('/attendance/report',      [$MA, 'attendanceReport'])->name('api.mobile.attendance.report');
+     Route::post('/attendance/rapid-scan',       [$MA, 'rapidScanAttendance'])->name('api.mobile.attendance.rapid-scan');
+     Route::post('/staff-attendance/rapid-scan', [$MA, 'rapidScanStaffAttendance'])->name('api.mobile.staff-attendance.rapid-scan');
++    Route::get('/staff-qr/me',                  [$MA, 'staffQrSelf'])->name('api.mobile.staff-qr.me');
+ 
+     // AI Insights (admin-only; delegates to AiInsightsController)
+     Route::get('/ai/insights',  [$MA, 'aiInsights'])->name('api.mobile.ai.insights');
+diff --git a/routes/web.php b/routes/web.php
+index ffef6a3..d82522e 100644
+--- a/routes/web.php
++++ b/routes/web.php
+@@ -477,6 +477,10 @@
+             Route::resource('designations', $DesigC)->except(['create', 'show', 'edit']);
+             
+             // Staff Directory & HR
++            // Bulk QR exports — must come BEFORE Route::resource('staff', ...)
++            // otherwise "qr-codes" gets caught by the {staff} parameter binding.
++            Route::get('staff/qr-codes/excel', [\App\Http\Controllers\School\StaffController::class, 'exportQrCodesExcel'])->name('staff.qr-codes.excel');
++            Route::get('staff/qr-codes/pdf',   [\App\Http\Controllers\School\StaffController::class, 'exportQrCodesPdf'])->name('staff.qr-codes.pdf');
+             Route::get('staff/{staff}/salary', [\App\Http\Controllers\School\StaffController::class, 'salaryForm'])->name('staff.salary');
+             Route::patch('staff/{staff}/salary', [\App\Http\Controllers\School\StaffController::class, 'updateSalary'])->name('staff.update-salary');
+             Route::get('staff/{staff}/request-edit', [\App\Http\Controllers\School\StaffController::class, 'createRequest'])->name('staff.request-edit');
+-- 
+2.52.0.windows.1
+

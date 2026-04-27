@@ -1,0 +1,129 @@
+From 3237237c99205151c159951d4b0f7321d0fe87dc Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 17:53:15 +0530
+Subject: [PATCH] =?UTF-8?q?feat:=20enrich=20/mobile/exams=20=E2=80=94=20fu?=
+ =?UTF-8?q?ll=20schedule=20data=20+=20teacher/admin=20scope?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The endpoint previously returned only schedule headers. Mobile now needs
+date/time/duration/marks per paper to render an exam schedule screen.
+
+- Adds a flattened `papers` array alongside the legacy `schedules` shape
+  so existing clients keep working.
+- Each paper row carries: subject_name, exam_date (Y-m-d),
+  exam_time (HH:MM:SS), duration_minutes, writing_marks, passing_marks,
+  is_co_scholastic, plus the parent exam_name + class/section names.
+- Role-aware scoping: parents/students see their child's class
+  (published only); teachers see schedules for classes they're assigned
+  to via TeacherScopeService; admins see everything including drafts.
+- Eager-loads sections + scheduleSubjects.subject in a single round-trip.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/Api/MobileApiController.php   | 85 +++++++++++++++----
+ 1 file changed, 69 insertions(+), 16 deletions(-)
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index 03a4b8c..73f6d9f 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -1045,25 +1045,78 @@ public function broadcastAnnouncement(Request $request, int $id): JsonResponse
+ 
+     public function exams(Request $request): JsonResponse
+     {
+-        $user      = $request->user();
+-        $school    = app('current_school');
+-        $yearId    = app()->bound('current_academic_year_id') ? app('current_academic_year_id') : null;
+-        $studentId = $this->resolveStudentId($user, $request);
+-        $history   = $studentId ? StudentAcademicHistory::where('student_id', $studentId)
+-            ->where('academic_year_id', $yearId)->first() : null;
++        $user   = $request->user();
++        $school = app('current_school');
++        $yearId = app()->bound('current_academic_year_id') ? app('current_academic_year_id') : null;
+ 
+-        $schedules = collect();
+-        if ($history) {
+-            $schedules = ExamSchedule::where('school_id', $school->id)
+-                ->where('academic_year_id', $yearId)
+-                ->where('course_class_id', $history->class_id)
+-                ->where('status', 'published')
+-                ->with(['examType:id,name,code', 'scheduleSubjects.subject:id,name'])
+-                ->orderByDesc('created_at')
+-                ->get();
++        $role = $user->user_type instanceof \App\Enums\UserType ? $user->user_type->value : (string) $user->user_type;
++        $isStaff = in_array($role, ['admin', 'super_admin', 'school_admin', 'principal', 'teacher']);
++
++        $query = ExamSchedule::where('school_id', $school->id)
++            ->where('academic_year_id', $yearId)
++            ->with([
++                'examType:id,name,code',
++                'courseClass:id,name',
++                'sections:id,name',
++                'scheduleSubjects' => fn($q) => $q->where('is_enabled', true)->orderBy('exam_date')->orderBy('exam_time'),
++                'scheduleSubjects.subject:id,name',
++            ]);
++
++        if ($isStaff && $role === 'teacher') {
++            // Teachers see schedules for classes they're assigned to (incharge or timetable)
++            $scope = app(\App\Services\TeacherScopeService::class)->for($user);
++            if ($scope->restricted) {
++                $classIds = array_keys($scope->allowedMap ?? []);
++                $query->whereIn('course_class_id', $classIds ?: [0]);
++            }
++            // Teachers see drafts too (their own work) — but only published from other teachers
++            // Keeping it simple: teachers see only published, same as parents/students. Admins see everything.
++            $query->where('status', 'published');
++        } elseif ($isStaff) {
++            // Admin / school admin / principal — see everything (drafts included so they can review)
++            // No additional filter
++        } else {
++            // Parent / student — scope to their child's class + published only
++            $studentId = $this->resolveStudentId($user, $request);
++            $history   = $studentId ? StudentAcademicHistory::where('student_id', $studentId)
++                ->where('academic_year_id', $yearId)->first() : null;
++            if (!$history) {
++                return response()->json(['schedules' => []]);
++            }
++            $query->where('course_class_id', $history->class_id)
++                  ->where('status', 'published');
+         }
+ 
+-        return response()->json(['schedules' => $schedules]);
++        $schedules = $query->orderByDesc('created_at')->get();
++
++        // Flatten the response — mobile UIs work better with denormalised rows.
++        // Each row is one subject paper with everything the screen needs.
++        $rows = $schedules->flatMap(function ($schedule) {
++            return $schedule->scheduleSubjects->map(function ($paper) use ($schedule) {
++                return [
++                    'id'                 => $paper->id,
++                    'schedule_id'        => $schedule->id,
++                    'exam_name'          => $schedule->examType?->name,
++                    'exam_code'          => $schedule->examType?->code,
++                    'class_name'         => $schedule->courseClass?->name,
++                    'section_names'      => $schedule->sections->pluck('name')->implode(', '),
++                    'subject_id'         => $paper->subject_id,
++                    'subject_name'       => $paper->subject?->name,
++                    'exam_date'          => $paper->exam_date ? \Carbon\Carbon::parse($paper->exam_date)->format('Y-m-d') : null,
++                    'exam_time'          => $paper->exam_time,                       // "HH:MM:SS" string
++                    'duration_minutes'   => $paper->duration_minutes,
++                    'writing_marks'      => $paper->writing_marks,
++                    'passing_marks'      => $paper->passing_marks,
++                    'is_co_scholastic'   => (bool) $paper->is_co_scholastic,
++                    'status'             => $schedule->status,
++                ];
++            });
++        })->values();
++
++        return response()->json([
++            'schedules' => $schedules, // legacy shape, keep for older clients
++            'papers'    => $rows,      // new flattened shape used by ExamScheduleScreen
++        ]);
+     }
+ 
+     // ── Profile ───────────────────────────────────────────────────────────────
+-- 
+2.52.0.windows.1
+

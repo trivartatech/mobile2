@@ -1,0 +1,572 @@
+From 2737452cd223cd5cc8a39fc013488229de237c26 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 15:34:08 +0530
+Subject: [PATCH] feat: push notifications via Expo + new triggers (diary,
+ assignment, fee_due)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Backend pieces of the mobile push-notification feature:
+
+- ExpoPushService — POSTs to https://exp.host/--/api/v2/push/send with
+  batching (100 per call) and DeviceNotRegistered token pruning.
+- users.expo_push_token / device_platform / push_token_updated_at columns
+  (FCM column kept for any non-Expo client).
+- POST /mobile/device/register now accepts expo_push_token (preferred)
+  alongside fcm_token.
+- NotificationService::sendPushToUser dispatches to Expo + FCM in parallel;
+  data payload carries {type, id, entity_id} so the mobile app can
+  deep-link to the relevant screen on tap.
+- New auto-fired triggers: notifyFeeDue (push channel), notifyDiary,
+  notifyAssignment. Wired into the diary + assignment creation paths in
+  both web (AssignmentController, StudentDiaryController) and mobile API
+  (storeDiary, storeAssignment) controllers.
+- Three new system templates auto-seed on next visit to Communication →
+  Templates: fee_due_reminder push, diary_created, assignment_created.
+- Renamed the broken notifyDiaryEntry call site to notifyDiary.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/Api/MobileApiController.php   |  29 ++-
+ .../School/Academic/AssignmentController.php  |   4 +-
+ .../Academic/StudentDiaryController.php       |   2 +-
+ .../CommunicationTemplateController.php       |  22 ++-
+ app/Models/User.php                           |  14 +-
+ app/Services/ExpoPushService.php              | 107 +++++++++++
+ app/Services/NotificationService.php          | 175 ++++++++++++++++--
+ ...27_150000_add_expo_push_token_to_users.php |  32 ++++
+ 8 files changed, 359 insertions(+), 26 deletions(-)
+ create mode 100644 app/Services/ExpoPushService.php
+ create mode 100644 database/migrations/2026_04_27_150000_add_expo_push_token_to_users.php
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index 47bb80d..03a4b8c 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -1184,12 +1184,28 @@ public function markAllNotificationsRead(Request $request): JsonResponse
+ 
+     public function registerDevice(Request $request): JsonResponse
+     {
++        // Accept either an Expo push token (preferred) or a raw FCM token.
++        // The mobile app uses Expo Push; FCM stays supported for any future
++        // client that doesn't go through Expo's relay.
+         $validated = $request->validate([
+-            'fcm_token'   => 'required|string',
+-            'device_type' => 'required|in:mobile,tablet',
+-            'platform'    => 'required|in:android,ios',
++            'expo_push_token' => 'nullable|string',
++            'fcm_token'       => 'nullable|string',
++            'device_type'     => 'nullable|in:mobile,tablet',
++            'platform'        => 'nullable|in:android,ios,web',
+         ]);
+-        $request->user()->update(['fcm_token' => $validated['fcm_token']]);
++
++        if (empty($validated['expo_push_token']) && empty($validated['fcm_token'])) {
++            return response()->json([
++                'message' => 'Either expo_push_token or fcm_token is required.',
++            ], 422);
++        }
++
++        $update = ['push_token_updated_at' => now()];
++        if (!empty($validated['expo_push_token'])) $update['expo_push_token'] = $validated['expo_push_token'];
++        if (!empty($validated['fcm_token']))       $update['fcm_token']       = $validated['fcm_token'];
++        if (!empty($validated['platform']))        $update['device_platform'] = $validated['platform'];
++
++        $request->user()->update($update);
+         return response()->json(['success' => true]);
+     }
+ 
+@@ -4275,6 +4291,9 @@ public function storeDiary(Request $request): JsonResponse
+             'attachments'      => $attachments,
+         ]);
+ 
++        try { (new \App\Services\NotificationService($school))->notifyDiary($diary); }
++        catch (\Throwable $e) { \Illuminate\Support\Facades\Log::warning('Diary push failed: ' . $e->getMessage()); }
++
+         return response()->json(['message' => 'Diary entry created.', 'id' => $diary->id], 201);
+     }
+ 
+@@ -4342,6 +4361,8 @@ public function storeAssignment(Request $request): JsonResponse
+                 'attachments'      => $attachments,
+             ]);
+             $ids[] = $a->id;
++            try { (new \App\Services\NotificationService($school))->notifyAssignment($a); }
++            catch (\Throwable $e) { \Illuminate\Support\Facades\Log::warning('Assignment push failed: ' . $e->getMessage()); }
+         }
+ 
+         return response()->json(['message' => 'Assignment created for ' . count($ids) . ' section(s).'], 201);
+diff --git a/app/Http/Controllers/School/Academic/AssignmentController.php b/app/Http/Controllers/School/Academic/AssignmentController.php
+index 2c2fd11..9b41269 100644
+--- a/app/Http/Controllers/School/Academic/AssignmentController.php
++++ b/app/Http/Controllers/School/Academic/AssignmentController.php
+@@ -146,7 +146,7 @@ public function store(Request $request)
+         }
+ 
+         foreach ($validated['section_ids'] as $sectionId) {
+-            Assignment::create([
++            $assignment = Assignment::create([
+                 'school_id'       => $schoolId,
+                 'academic_year_id'=> $academicYearId,
+                 'class_id'        => $validated['class_id'],
+@@ -160,6 +160,8 @@ public function store(Request $request)
+                 'status'          => $validated['status'] ?? 'published',
+                 'attachments'     => $attachments,
+             ]);
++            try { (new \App\Services\NotificationService(app('current_school')))->notifyAssignment($assignment); }
++            catch (\Throwable $e) { \Illuminate\Support\Facades\Log::warning('Assignment push failed: ' . $e->getMessage()); }
+         }
+ 
+         return back()->with('success', 'Assignment created successfully.');
+diff --git a/app/Http/Controllers/School/Academic/StudentDiaryController.php b/app/Http/Controllers/School/Academic/StudentDiaryController.php
+index 9593e9f..32cc101 100644
+--- a/app/Http/Controllers/School/Academic/StudentDiaryController.php
++++ b/app/Http/Controllers/School/Academic/StudentDiaryController.php
+@@ -311,7 +311,7 @@ public function store(Request $request)
+                 $school = app('current_school');
+                 if ($school && class_exists(\App\Services\NotificationService::class)) {
+                     $notificationService = new \App\Services\NotificationService($school);
+-                    $notificationService->notifyDiaryEntry($firstDiary);
++                    $notificationService->notifyDiary($firstDiary);
+                 }
+             } catch (\Throwable $e) {
+                 Log::error('Diary notification failed', [
+diff --git a/app/Http/Controllers/School/CommunicationTemplateController.php b/app/Http/Controllers/School/CommunicationTemplateController.php
+index eb665b4..70781eb 100644
+--- a/app/Http/Controllers/School/CommunicationTemplateController.php
++++ b/app/Http/Controllers/School/CommunicationTemplateController.php
+@@ -42,12 +42,32 @@ class CommunicationTemplateController extends Controller
+         'fee_due_reminder' => [
+             'name'      => 'Fee Due Reminder',
+             'variables' => ['name', 'amount', 'date', 'course_name', 'batch_name'],
+-            'channels'  => ['sms', 'whatsapp', 'voice'],
++            'channels'  => ['sms', 'whatsapp', 'voice', 'push'],
+             'defaults'  => [
+                 'sms'      => 'Dear Parent, fee of Rs.##AMOUNT## is due for ##NAME## (##COURSE_NAME##) by ##DATE##. Please pay at the earliest.',
+                 'whatsapp' => 'Dear Parent, fee of Rs.##AMOUNT## is due for ##NAME## (##COURSE_NAME##) by ##DATE##. Please pay at the earliest.',
+                 'voice'    => 'Dear parent, fee of rupees ##AMOUNT## is due for ##NAME## by ##DATE##. Please pay at the earliest.',
++                'push'     => 'Fee of Rs.##AMOUNT## is due for ##NAME## by ##DATE##.',
++            ],
++            'subjects'  => ['push' => 'Fee Due - ##NAME##'],
++        ],
++        'diary_created' => [
++            'name'      => 'New Diary Entry',
++            'variables' => ['name', 'subject', 'date', 'course_name', 'batch_name', 'app_name'],
++            'channels'  => ['push'],
++            'defaults'  => [
++                'push' => 'A new diary entry has been added for ##NAME## (##SUBJECT##) on ##DATE##.',
++            ],
++            'subjects'  => ['push' => 'New Diary Entry - ##NAME##'],
++        ],
++        'assignment_created' => [
++            'name'      => 'New Assignment',
++            'variables' => ['name', 'title', 'subject', 'due_date', 'course_name', 'batch_name', 'app_name'],
++            'channels'  => ['push'],
++            'defaults'  => [
++                'push' => '##TITLE## (##SUBJECT##) for ##NAME##. Due ##DUE_DATE##.',
+             ],
++            'subjects'  => ['push' => 'New Assignment - ##TITLE##'],
+         ],
+         'otp' => [
+             'name'      => 'Login OTP',
+diff --git a/app/Models/User.php b/app/Models/User.php
+index 5a11f69..8857112 100644
+--- a/app/Models/User.php
++++ b/app/Models/User.php
+@@ -20,6 +20,7 @@ class User extends Authenticatable
+         'name', 'username', 'email', 'phone',
+         'password', 'avatar', 'user_type',
+         'is_active', 'fcm_token',
++        'expo_push_token', 'device_platform', 'push_token_updated_at',
+     ];
+ 
+     protected $hidden = [
+@@ -30,12 +31,13 @@ class User extends Authenticatable
+     protected function casts(): array
+     {
+         return [
+-            'email_verified_at'   => 'datetime',
+-            'phone_verified_at'   => 'datetime',
+-            'last_login_at'       => 'datetime',
+-            'password'            => 'hashed',
+-            'is_active'           => 'boolean',
+-            'user_type'           => UserType::class,
++            'email_verified_at'      => 'datetime',
++            'phone_verified_at'      => 'datetime',
++            'last_login_at'          => 'datetime',
++            'push_token_updated_at'  => 'datetime',
++            'password'               => 'hashed',
++            'is_active'              => 'boolean',
++            'user_type'              => UserType::class,
+         ];
+     }
+ 
+diff --git a/app/Services/ExpoPushService.php b/app/Services/ExpoPushService.php
+new file mode 100644
+index 0000000..37dc218
+--- /dev/null
++++ b/app/Services/ExpoPushService.php
+@@ -0,0 +1,107 @@
++<?php
++
++namespace App\Services;
++
++use App\Models\User;
++use Illuminate\Support\Facades\Http;
++use Illuminate\Support\Facades\Log;
++
++/**
++ * Expo Push Notification service.
++ *
++ * Wraps Expo's HTTP push API at https://exp.host/--/api/v2/push/send.
++ * Tokens look like ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]. The service
++ * handles batching (Expo accepts up to 100 messages per call) and prunes
++ * tokens that come back as DeviceNotRegistered so we stop spamming dead
++ * devices.
++ *
++ * No setup required: Expo Push works without google-services.json or APNs
++ * certs because Expo's relay handles delivery.
++ */
++class ExpoPushService
++{
++    private const PUSH_URL  = 'https://exp.host/--/api/v2/push/send';
++    private const BATCH_MAX = 100;
++
++    /**
++     * Send a push to a single user.
++     * Returns true if the user has a token AND the API request succeeded.
++     */
++    public function sendToUser(?User $user, string $title, string $body, array $data = []): bool
++    {
++        if (!$user || empty($user->expo_push_token)) return false;
++        return $this->sendToTokens([$user->expo_push_token], $title, $body, $data);
++    }
++
++    /**
++     * Send the same payload to many tokens (batched).
++     */
++    public function sendToTokens(array $tokens, string $title, string $body, array $data = []): bool
++    {
++        $tokens = array_values(array_unique(array_filter($tokens)));
++        if (empty($tokens)) return false;
++
++        $allOk = true;
++        foreach (array_chunk($tokens, self::BATCH_MAX) as $batch) {
++            $messages = array_map(fn($t) => [
++                'to'           => $t,
++                'title'        => $title,
++                'body'         => $body,
++                'data'         => $data,
++                'sound'        => 'default',
++                'priority'     => 'high',
++                'channelId'    => 'default',
++            ], $batch);
++
++            try {
++                $response = Http::timeout(10)
++                    ->withHeaders([
++                        'Accept'           => 'application/json',
++                        'Accept-encoding'  => 'gzip, deflate',
++                        'Content-Type'     => 'application/json',
++                    ])
++                    ->post(self::PUSH_URL, $messages);
++
++                if (!$response->successful()) {
++                    Log::warning('[ExpoPush] Send failed', [
++                        'status' => $response->status(),
++                        'body'   => $response->body(),
++                    ]);
++                    $allOk = false;
++                    continue;
++                }
++
++                $tickets = $response->json('data') ?? [];
++                $this->pruneInvalidTokens($batch, $tickets);
++            } catch (\Throwable $e) {
++                Log::error('[ExpoPush] Exception during send: ' . $e->getMessage());
++                $allOk = false;
++            }
++        }
++
++        return $allOk;
++    }
++
++    /**
++     * If Expo reports a token as no longer registered, null it on the User row
++     * so we never send to it again. The user will re-register on next login.
++     */
++    protected function pruneInvalidTokens(array $batchTokens, array $tickets): void
++    {
++        foreach ($tickets as $i => $ticket) {
++            if (($ticket['status'] ?? null) !== 'error') continue;
++
++            $errCode = $ticket['details']['error'] ?? null;
++            if (!in_array($errCode, ['DeviceNotRegistered', 'InvalidCredentials'])) continue;
++
++            $deadToken = $batchTokens[$i] ?? null;
++            if (!$deadToken) continue;
++
++            User::where('expo_push_token', $deadToken)->update([
++                'expo_push_token'        => null,
++                'push_token_updated_at'  => now(),
++            ]);
++            Log::info('[ExpoPush] Pruned invalid token', ['error' => $errCode]);
++        }
++    }
++}
+diff --git a/app/Services/NotificationService.php b/app/Services/NotificationService.php
+index 8d1e110..cfc38df 100644
+--- a/app/Services/NotificationService.php
++++ b/app/Services/NotificationService.php
+@@ -14,15 +14,22 @@ class NotificationService
+ {
+     protected $school;
+     protected ?FirebaseService $firebase;
++    protected ?ExpoPushService $expo;
+ 
+     public function __construct(?School $school = null)
+     {
+         $this->school = $school ?? (app()->bound('current_school') ? app('current_school') : null);
+         $this->firebase = app(FirebaseService::class);
++        $this->expo     = app(ExpoPushService::class);
+     }
+ 
+     /**
+-     * Send a push notification to a user — saves to DB + sends via FCM.
++     * Send a push notification to a user — always saves to DB, then dispatches
++     * to whatever push transports the user is registered with (Expo, FCM, or
++     * both).
++     *
++     * The data payload includes `type` and `id` so the mobile app can deep-link
++     * to the right screen on tap.
+      */
+     protected function sendPushToUser(?User $user, array $notiData): void
+     {
+@@ -30,25 +37,31 @@ protected function sendPushToUser(?User $user, array $notiData): void
+ 
+         $eventType = $notiData['event_type'] ?? null;
+ 
+-        // Check push preference (default: enabled)
++        // Respect the user's per-channel preference (default: enabled)
+         if ($eventType && !\App\Models\NotificationPreference::isEnabled($user->id, $eventType, 'push')) {
+             return;
+         }
+ 
+-        // Save to DB via Laravel notification system
++        // 1. Save to DB so the in-app inbox shows it even if push fails / device offline
+         $user->notify(new \App\Notifications\CommunicationPortalNotification($notiData));
+ 
+-        // Send via FCM (non-blocking — failures are logged, not thrown)
++        $title = $notiData['title']   ?? ($this->school->name ?? 'EduConnect');
++        $body  = $notiData['message'] ?? '';
++        $data  = array_filter([
++            'type'      => $notiData['type']      ?? 'general',
++            'id'        => $notiData['id']        ?? null,
++            'entity_id' => $notiData['entity_id'] ?? null,
++        ], fn($v) => $v !== null);
++
++        // 2. Expo Push (preferred — what the React Native app uses)
++        if ($user->expo_push_token) {
++            $this->expo->sendToUser($user, $title, $body, $data);
++        }
++
++        // 3. Direct FCM (kept for any non-Expo client; never fires until
++        //    FIREBASE_CREDENTIALS is configured)
+         if ($this->firebase->isEnabled() && $user->fcm_token) {
+-            $this->firebase->sendToUser(
+-                $user,
+-                $notiData['title'] ?? 'EduConnect',
+-                $notiData['message'] ?? '',
+-                array_filter([
+-                    'type' => $notiData['type'] ?? 'general',
+-                    'id'   => $notiData['id'] ?? null,
+-                ])
+-            );
++            $this->firebase->sendToUser($user, $title, $body, $data);
+         }
+     }
+ 
+@@ -473,6 +486,142 @@ public function notifyFeeDue($student, $amount, $dueDate)
+             $message = $this->replacePlaceholders($voiceTemplate->content, $data);
+             $this->sendVoiceCall($parent->primary_phone, $voiceTemplate->audio_url, $message, $parent->user_id);
+         }
++
++        $pushTemplate = $this->getTemplate('push', 'fee_due_reminder');
++        if ($pushTemplate) {
++            $message = $this->replacePlaceholders($pushTemplate->content, $data);
++            $notiData = [
++                'type'       => 'fee_due',
++                'event_type' => 'fee_due_reminder',
++                'title'      => $this->replacePlaceholders($pushTemplate->subject ?? 'Fee Due Reminder', $data),
++                'message'    => $message,
++                'sender'     => $this->school->name,
++                'entity_id'  => $student->id,
++            ];
++            $this->sendPushToUser($parent->user ?? null, $notiData);
++            $this->sendPushToUser($student->user ?? null, $notiData);
++        }
++    }
++
++    /**
++     * Diary entry created — notifies parents (and the student if logged in).
++     */
++    public function notifyDiary($diary)
++    {
++        $pushTemplate = $this->getTemplate('push', 'diary_created');
++        if (!$pushTemplate) return;
++
++        // Resolve target students. Diary entries can be class-wide or specific.
++        $studentIds = $this->resolveDiaryRecipients($diary);
++        if (empty($studentIds)) return;
++
++        $students = \App\Models\Student::whereIn('id', $studentIds)
++            ->with(['studentParent.user', 'user', 'currentAcademicHistory.courseClass', 'currentAcademicHistory.section'])
++            ->get();
++
++        foreach ($students as $student) {
++            $data = [
++                'name'        => $student->name,
++                'subject'     => $diary->subject ?? 'General',
++                'date'        => optional($diary->entry_date ?? $diary->created_at)->format('d-M-Y'),
++                'course_name' => $student->currentAcademicHistory?->courseClass?->name ?? '',
++                'batch_name'  => $student->currentAcademicHistory?->section?->name ?? '',
++                'app_name'    => $this->school->name,
++            ];
++
++            $notiData = [
++                'type'       => 'diary',
++                'event_type' => 'diary_created',
++                'title'      => $this->replacePlaceholders($pushTemplate->subject ?? 'New Diary Entry', $data),
++                'message'    => $this->replacePlaceholders($pushTemplate->content, $data),
++                'sender'     => $this->school->name,
++                'entity_id'  => $diary->id,
++            ];
++
++            $this->sendPushToUser($student->studentParent?->user ?? null, $notiData);
++            $this->sendPushToUser($student->user ?? null, $notiData);
++        }
++    }
++
++    /**
++     * Assignment created — notifies parents and students of the target class/section.
++     */
++    public function notifyAssignment($assignment)
++    {
++        $pushTemplate = $this->getTemplate('push', 'assignment_created');
++        if (!$pushTemplate) return;
++
++        $studentIds = $this->resolveAssignmentRecipients($assignment);
++        if (empty($studentIds)) return;
++
++        $students = \App\Models\Student::whereIn('id', $studentIds)
++            ->with(['studentParent.user', 'user', 'currentAcademicHistory.courseClass', 'currentAcademicHistory.section'])
++            ->get();
++
++        $dueDate = optional($assignment->due_date ?? null)->format('d-M-Y') ?? '—';
++
++        foreach ($students as $student) {
++            $data = [
++                'name'        => $student->name,
++                'title'       => $assignment->title ?? 'New Assignment',
++                'subject'     => $assignment->subject ?? 'General',
++                'due_date'    => $dueDate,
++                'course_name' => $student->currentAcademicHistory?->courseClass?->name ?? '',
++                'batch_name'  => $student->currentAcademicHistory?->section?->name ?? '',
++                'app_name'    => $this->school->name,
++            ];
++
++            $notiData = [
++                'type'       => 'assignment',
++                'event_type' => 'assignment_created',
++                'title'      => $this->replacePlaceholders($pushTemplate->subject ?? 'New Assignment', $data),
++                'message'    => $this->replacePlaceholders($pushTemplate->content, $data),
++                'sender'     => $this->school->name,
++                'entity_id'  => $assignment->id,
++            ];
++
++            $this->sendPushToUser($student->studentParent?->user ?? null, $notiData);
++            $this->sendPushToUser($student->user ?? null, $notiData);
++        }
++    }
++
++    /**
++     * Resolve diary recipients. Diaries can target a class+section combo
++     * (broadcast) or a specific student via student_id.
++     */
++    protected function resolveDiaryRecipients($diary): array
++    {
++        if (!empty($diary->student_id)) {
++            return [$diary->student_id];
++        }
++
++        $academicYearId = app()->bound('current_academic_year_id') ? app('current_academic_year_id') : null;
++
++        return \App\Models\StudentAcademicHistory::query()
++            ->when($academicYearId, fn($q) => $q->where('academic_year_id', $academicYearId))
++            ->when($diary->class_id, fn($q) => $q->where('class_id', $diary->class_id))
++            ->when($diary->section_id ?? null, fn($q) => $q->where('section_id', $diary->section_id))
++            ->pluck('student_id')
++            ->unique()
++            ->values()
++            ->all();
++    }
++
++    /**
++     * Resolve assignment recipients — class + section based.
++     */
++    protected function resolveAssignmentRecipients($assignment): array
++    {
++        $academicYearId = app()->bound('current_academic_year_id') ? app('current_academic_year_id') : null;
++
++        return \App\Models\StudentAcademicHistory::query()
++            ->when($academicYearId, fn($q) => $q->where('academic_year_id', $academicYearId))
++            ->when($assignment->class_id, fn($q) => $q->where('class_id', $assignment->class_id))
++            ->when($assignment->section_id ?? null, fn($q) => $q->where('section_id', $assignment->section_id))
++            ->pluck('student_id')
++            ->unique()
++            ->values()
++            ->all();
+     }
+ 
+     /**
+diff --git a/database/migrations/2026_04_27_150000_add_expo_push_token_to_users.php b/database/migrations/2026_04_27_150000_add_expo_push_token_to_users.php
+new file mode 100644
+index 0000000..2aa1212
+--- /dev/null
++++ b/database/migrations/2026_04_27_150000_add_expo_push_token_to_users.php
+@@ -0,0 +1,32 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++/**
++ * Adds Expo push token column for the React Native app.
++ * Existing fcm_token column is kept untouched so a future FCM integration
++ * can sit alongside Expo without another migration.
++ */
++return new class extends Migration {
++    public function up(): void
++    {
++        Schema::table('users', function (Blueprint $table) {
++            if (!Schema::hasColumn('users', 'expo_push_token')) {
++                $table->string('expo_push_token')->nullable()->after('fcm_token');
++                $table->string('device_platform', 16)->nullable()->after('expo_push_token'); // ios | android | web
++                $table->timestamp('push_token_updated_at')->nullable()->after('device_platform');
++            }
++        });
++    }
++
++    public function down(): void
++    {
++        Schema::table('users', function (Blueprint $table) {
++            foreach (['expo_push_token', 'device_platform', 'push_token_updated_at'] as $col) {
++                if (Schema::hasColumn('users', $col)) $table->dropColumn($col);
++            }
++        });
++    }
++};
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,402 @@
+From 11c1eb9fd21d433237922a19e108d27f09662863 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 12:11:52 +0530
+Subject: [PATCH] =?UTF-8?q?feat:=20M2=20=E2=80=94=20auto-fill=20'holiday'?=
+ =?UTF-8?q?=20attendance=20+=20exclude=20from=20%?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The 'holidays' table existed and the dashboard read it, but attendance
+records weren't being created on declared holidays. Everyone showed as
+"unmarked" — and even when admin manually marked 'holiday', the
+attendance % treated those days as absent because the denominator was
+total instead of working_days.
+
+Two parts:
+
+1. New artisan command 'attendance:fill-holidays'
+   php artisan attendance:fill-holidays                        # today
+   php artisan attendance:fill-holidays --date=2026-04-26
+   php artisan attendance:fill-holidays --school=3 --days=30   # backfill 30 days
+   php artisan attendance:fill-holidays --force                # overwrite
+
+   For each declared Holiday in the date range, creates a 'holiday'
+   row for every active student and active staff in that school.
+   Idempotent — uses updateOrCreate. Won't overwrite existing
+   non-holiday rows unless --force. Multi-day holidays (date..end_date)
+   are expanded to one row per day.
+
+2. Daily schedule (routes/console.php)
+   Schedule::command('attendance:fill-holidays')->dailyAt('00:30')
+       ->withoutOverlapping();
+
+   Runs early so the rows exist before anyone opens the dashboard or
+   mark page on a holiday morning.
+
+3. Attendance % now excludes holidays from the denominator
+   (present + late*0.5 + half_day*0.5) / (total - holiday)
+
+   Touched four mobile API summary builders:
+     MobileApiController::attendance() teacher branch
+     MobileApiController::attendance() student/parent branch
+     MobileApiController::stats() — parent dashboard tile
+     MobileApiController::attendanceSummary() — dashboard widget
+     Api/Mobile/AttendanceController.php
+   All now return 'holiday' and 'working_days' alongside the existing
+   present/absent/late/half_day/leave breakdown.
+
+Prerequisites: the enum migration from the previous commit
+(2026_04_27_114325_add_holiday_to_attendance_status_enum) — without it
+the inserts would fail with truncation errors.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Commands/FillHolidayAttendance.php        | 205 ++++++++++++++++++
+ .../Api/Mobile/AttendanceController.php       |   9 +-
+ .../Controllers/Api/MobileApiController.php   |  36 ++-
+ routes/console.php                            |   7 +
+ 4 files changed, 242 insertions(+), 15 deletions(-)
+ create mode 100644 app/Console/Commands/FillHolidayAttendance.php
+
+diff --git a/app/Console/Commands/FillHolidayAttendance.php b/app/Console/Commands/FillHolidayAttendance.php
+new file mode 100644
+index 0000000..b88926c
+--- /dev/null
++++ b/app/Console/Commands/FillHolidayAttendance.php
+@@ -0,0 +1,205 @@
++<?php
++
++namespace App\Console\Commands;
++
++use App\Models\Attendance;
++use App\Models\Holiday;
++use App\Models\School;
++use App\Models\Staff;
++use App\Models\StaffAttendance;
++use App\Models\Student;
++use App\Models\StudentAcademicHistory;
++use Illuminate\Console\Command;
++use Illuminate\Support\Carbon;
++use Illuminate\Support\Facades\DB;
++
++/**
++ * Auto-fill 'holiday' attendance rows on declared holidays.
++ *
++ * Usage:
++ *   php artisan attendance:fill-holidays                 → today only, all schools
++ *   php artisan attendance:fill-holidays --date=2026-04-26
++ *   php artisan attendance:fill-holidays --school=3 --days=30   → backfill 30 days
++ *
++ * Idempotent — uses updateOrCreate so re-runs don't duplicate.
++ * Won't overwrite existing rows (e.g. a student marked Present on what
++ * later got declared a holiday) unless --force is passed.
++ */
++class FillHolidayAttendance extends Command
++{
++    protected $signature = 'attendance:fill-holidays
++        {--date= : YYYY-MM-DD; defaults to today}
++        {--days= : Backfill the last N days instead of just one date}
++        {--school= : Limit to a specific school_id}
++        {--force : Overwrite existing non-holiday rows on holiday dates}';
++
++    protected $description = 'Mark every active student and staff as holiday on declared school holidays.';
++
++    public function handle(): int
++    {
++        $endDate    = $this->option('date') ? Carbon::parse($this->option('date')) : Carbon::today();
++        $daysBack   = (int) ($this->option('days') ?? 0);
++        $startDate  = $daysBack > 0 ? $endDate->copy()->subDays($daysBack - 1) : $endDate->copy();
++        $schoolFlag = $this->option('school');
++        $force      = (bool) $this->option('force');
++
++        $schools = School::query()
++            ->when($schoolFlag, fn($q) => $q->where('id', $schoolFlag))
++            ->where('status', 'active')
++            ->get();
++
++        if ($schools->isEmpty()) {
++            $this->warn('No active schools found.');
++            return self::SUCCESS;
++        }
++
++        $totalStudents = 0;
++        $totalStaff    = 0;
++        $totalSkipped  = 0;
++
++        foreach ($schools as $school) {
++            $holidayDates = Holiday::where('school_id', $school->id)
++                ->where(function ($q) use ($startDate, $endDate) {
++                    // A holiday hits the window if its [date, end_date|date] overlaps
++                    $q->whereBetween('date', [$startDate, $endDate])
++                      ->orWhere(function ($q2) use ($startDate, $endDate) {
++                          $q2->whereNotNull('end_date')
++                             ->where('date', '<=', $endDate)
++                             ->where('end_date', '>=', $startDate);
++                      });
++                })
++                ->get()
++                ->flatMap(function ($h) use ($startDate, $endDate) {
++                    $from = Carbon::parse($h->date)->max($startDate);
++                    $to   = Carbon::parse($h->end_date ?? $h->date)->min($endDate);
++                    $dates = collect();
++                    for ($d = $from->copy(); $d->lte($to); $d->addDay()) {
++                        $dates->push($d->toDateString());
++                    }
++                    return $dates;
++                })
++                ->unique()
++                ->values();
++
++            if ($holidayDates->isEmpty()) {
++                continue;
++            }
++
++            $this->line("School #{$school->id} {$school->name}: " . $holidayDates->count() . ' holiday day(s) in range');
++
++            // Resolve current academic year for this school (needed for student attendance row)
++            $currentYear = \App\Models\AcademicYear::where('school_id', $school->id)
++                ->where('is_current', true)->first();
++
++            foreach ($holidayDates as $dateStr) {
++                $sStudents = $this->fillStudents($school, $dateStr, $currentYear, $force);
++                $sStaff    = $this->fillStaff($school, $dateStr, $force);
++                $totalStudents += $sStudents['written'];
++                $totalStaff    += $sStaff['written'];
++                $totalSkipped  += $sStudents['skipped'] + $sStaff['skipped'];
++            }
++        }
++
++        $this->info("Done. Wrote {$totalStudents} student row(s) and {$totalStaff} staff row(s). Skipped {$totalSkipped} pre-existing non-holiday row(s).");
++
++        return self::SUCCESS;
++    }
++
++    /**
++     * Fill student attendance for a single school on a single date.
++     * Returns [written => N, skipped => M].
++     */
++    private function fillStudents(School $school, string $dateStr, $currentYear, bool $force): array
++    {
++        if (!$currentYear) return ['written' => 0, 'skipped' => 0];
++
++        // Active students with their current class/section
++        $rows = StudentAcademicHistory::where('school_id', $school->id)
++            ->where('academic_year_id', $currentYear->id)
++            ->where('status', 'current')
++            ->get(['student_id', 'class_id', 'section_id']);
++
++        if ($rows->isEmpty()) return ['written' => 0, 'skipped' => 0];
++
++        $written = 0;
++        $skipped = 0;
++
++        DB::transaction(function () use ($rows, $school, $currentYear, $dateStr, $force, &$written, &$skipped) {
++            foreach ($rows as $r) {
++                $existing = Attendance::where('school_id', $school->id)
++                    ->where('student_id', $r->student_id)
++                    ->where('date', $dateStr)
++                    ->first();
++
++                if ($existing && !$force && $existing->status !== 'holiday') {
++                    $skipped++;
++                    continue;
++                }
++
++                Attendance::updateOrCreate(
++                    [
++                        'school_id'  => $school->id,
++                        'student_id' => $r->student_id,
++                        'date'       => $dateStr,
++                    ],
++                    [
++                        'academic_year_id' => $currentYear->id,
++                        'class_id'         => $r->class_id,
++                        'section_id'       => $r->section_id,
++                        'status'           => 'holiday',
++                        'remarks'          => 'Auto: school holiday',
++                        'marked_by'        => null,
++                    ]
++                );
++                $written++;
++            }
++        });
++
++        return ['written' => $written, 'skipped' => $skipped];
++    }
++
++    /**
++     * Fill staff attendance for a single school on a single date.
++     */
++    private function fillStaff(School $school, string $dateStr, bool $force): array
++    {
++        $staffIds = Staff::where('school_id', $school->id)
++            ->where('status', 'active')
++            ->pluck('id');
++
++        if ($staffIds->isEmpty()) return ['written' => 0, 'skipped' => 0];
++
++        $written = 0;
++        $skipped = 0;
++
++        DB::transaction(function () use ($staffIds, $school, $dateStr, $force, &$written, &$skipped) {
++            foreach ($staffIds as $staffId) {
++                $existing = StaffAttendance::where('school_id', $school->id)
++                    ->where('staff_id', $staffId)
++                    ->where('date', $dateStr)
++                    ->first();
++
++                if ($existing && !$force && $existing->status !== 'holiday') {
++                    $skipped++;
++                    continue;
++                }
++
++                StaffAttendance::updateOrCreate(
++                    [
++                        'school_id' => $school->id,
++                        'staff_id'  => $staffId,
++                        'date'      => $dateStr,
++                    ],
++                    [
++                        'status'    => 'holiday',
++                        'remarks'   => 'Auto: school holiday',
++                        'marked_by' => null,
++                    ]
++                );
++                $written++;
++            }
++        });
++
++        return ['written' => $written, 'skipped' => $skipped];
++    }
++}
+diff --git a/app/Http/Controllers/Api/Mobile/AttendanceController.php b/app/Http/Controllers/Api/Mobile/AttendanceController.php
+index 6e72f58..2e10aaf 100644
+--- a/app/Http/Controllers/Api/Mobile/AttendanceController.php
++++ b/app/Http/Controllers/Api/Mobile/AttendanceController.php
+@@ -73,11 +73,14 @@ public function attendance(Request $request): JsonResponse
+             'late'           => $records->where('status', 'late')->count(),
+             'half_day'       => $records->where('status', 'half_day')->count(),
+             'leave'          => $records->where('status', 'leave')->count(),
++            'holiday'        => $records->where('status', 'holiday')->count(),
+             'total'          => $records->count(),
+         ];
+-        // Canonical formula: (present + late*0.5 + half_day*0.5) / total
+-        $summary['attendance_pct'] = $summary['total'] > 0
+-            ? round(($summary['present'] + $summary['late'] * 0.5 + $summary['half_day'] * 0.5) / $summary['total'] * 100, 1)
++        // Canonical formula — holidays excluded from denominator
++        $workingDays = max(0, $summary['total'] - $summary['holiday']);
++        $summary['working_days']   = $workingDays;
++        $summary['attendance_pct'] = $workingDays > 0
++            ? round(($summary['present'] + $summary['late'] * 0.5 + $summary['half_day'] * 0.5) / $workingDays * 100, 1)
+             : 100;
+ 
+         return response()->json([
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index c3696ea..54140a8 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -521,12 +521,15 @@ public function attendance(Request $request): JsonResponse
+                 'late'     => $records->where('status', 'late')->count(),
+                 'half_day' => $records->where('status', 'half_day')->count(),
+                 'leave'    => $records->where('status', 'leave')->count(),
++                'holiday'  => $records->where('status', 'holiday')->count(),
+                 'total'    => $records->count(),
+             ];
+-            // Canonical attendance % formula across the whole app:
+-            // (present + late*0.5 + half_day*0.5) / total — late & half_day count as half credit.
+-            $summary['attendance_pct'] = $summary['total'] > 0
+-                ? round(($summary['present'] + $summary['late'] * 0.5 + $summary['half_day'] * 0.5) / $summary['total'] * 100, 1)
++            // Canonical attendance % formula:
++            // (present + late*0.5 + half_day*0.5) / (total - holiday) — holidays are not working days.
++            $workingDays = max(0, $summary['total'] - $summary['holiday']);
++            $summary['working_days']    = $workingDays;
++            $summary['attendance_pct']  = $workingDays > 0
++                ? round(($summary['present'] + $summary['late'] * 0.5 + $summary['half_day'] * 0.5) / $workingDays * 100, 1)
+                 : 0;
+ 
+             $dateFmt = $school->dateFmt();
+@@ -556,11 +559,14 @@ public function attendance(Request $request): JsonResponse
+             'late'           => $records->where('status', 'late')->count(),
+             'half_day'       => $records->where('status', 'half_day')->count(),
+             'leave'          => $records->where('status', 'leave')->count(),
++            'holiday'        => $records->where('status', 'holiday')->count(),
+             'total'          => $records->count(),
+         ];
+-        // Canonical formula: (present + late*0.5 + half_day*0.5) / total
+-        $summary['attendance_pct'] = $summary['total'] > 0
+-            ? round(($summary['present'] + $summary['late'] * 0.5 + $summary['half_day'] * 0.5) / $summary['total'] * 100, 1)
++        // Canonical formula: holidays excluded from denominator (not working days)
++        $workingDays = max(0, $summary['total'] - $summary['holiday']);
++        $summary['working_days']   = $workingDays;
++        $summary['attendance_pct'] = $workingDays > 0
++            ? round(($summary['present'] + $summary['late'] * 0.5 + $summary['half_day'] * 0.5) / $workingDays * 100, 1)
+             : 100;
+ 
+         $dateFmt = $school->dateFmt();
+@@ -1387,10 +1393,12 @@ private function stats($user, ?int $yearId, Request $request): array
+             $studentId = $this->resolveStudentId($user, $request);
+             if (!$studentId || !$yearId) return [];
+ 
+-            // Canonical formula — (present + late*0.5 + half_day*0.5) / total
+-            $totalAtt    = Attendance::where('student_id', $studentId)->where('academic_year_id', $yearId)->count();
++            // Canonical formula — (present + late*0.5 + half_day*0.5) / working_days
++            // working_days = total records minus 'holiday' rows (holidays aren't working days).
+             $statusCount = Attendance::where('student_id', $studentId)->where('academic_year_id', $yearId)
+                 ->selectRaw('status, COUNT(*) as c')->groupBy('status')->pluck('c', 'status')->toArray();
++            $totalAtt    = array_sum($statusCount);
++            $workingDays = max(0, $totalAtt - ($statusCount['holiday'] ?? 0));
+             $weighted    = ($statusCount['present'] ?? 0)
+                          + ($statusCount['late']     ?? 0) * 0.5
+                          + ($statusCount['half_day'] ?? 0) * 0.5;
+@@ -1398,7 +1406,7 @@ private function stats($user, ?int $yearId, Request $request): array
+             $feeSummary  = $student ? $this->feeService->getStudentFeeSummary($student, $yearId, $school->id) : [];
+ 
+             return [
+-                'attendance_pct'      => $totalAtt > 0 ? round($weighted / $totalAtt * 100) : 0,
++                'attendance_pct'      => $workingDays > 0 ? round($weighted / $workingDays * 100) : 0,
+                 'fee_balance'         => $feeSummary['balance']   ?? 0,
+                 'pending_assignments' => 0,
+                 'upcoming_exams'      => ExamSchedule::where('school_id', $school->id)
+@@ -1566,7 +1574,9 @@ private function attendanceSummary($user, ?int $yearId, Request $request): array
+         $late     = $records->where('status', 'late')->count();
+         $halfDay  = $records->where('status', 'half_day')->count();
+         $leave    = $records->where('status', 'leave')->count();
++        $holiday  = $records->where('status', 'holiday')->count();
+         $total    = $records->count();
++        $workingDays = max(0, $total - $holiday);
+ 
+         return [
+             'present'        => $present,
+@@ -1574,9 +1584,11 @@ private function attendanceSummary($user, ?int $yearId, Request $request): array
+             'late'           => $late,
+             'half_day'       => $halfDay,
+             'leave'          => $leave,
++            'holiday'        => $holiday,
+             'total'          => $total,
+-            // Canonical formula: (present + late*0.5 + half_day*0.5) / total
+-            'attendance_pct' => $total > 0 ? round(($present + $late * 0.5 + $halfDay * 0.5) / $total * 100) : 0,
++            'working_days'   => $workingDays,
++            // Canonical: (present + late*0.5 + half_day*0.5) / working_days (excludes holidays)
++            'attendance_pct' => $workingDays > 0 ? round(($present + $late * 0.5 + $halfDay * 0.5) / $workingDays * 100) : 0,
+             'today_status'   => $todayRecord?->status ?? 'not_marked',
+             'month'          => now()->format('M Y'),
+         ];
+diff --git a/routes/console.php b/routes/console.php
+index 0641b8a..29394c7 100644
+--- a/routes/console.php
++++ b/routes/console.php
+@@ -46,3 +46,10 @@
+     ->daily()
+     ->at('03:00');
+ 
++// Auto-fill 'holiday' attendance rows for every active student and staff on
++// declared school holidays. Idempotent — safe to re-run. Runs early so the
++// rows exist before anyone opens the dashboard / mark page.
++Schedule::command('attendance:fill-holidays')
++    ->dailyAt('00:30')
++    ->withoutOverlapping();
++
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,106 @@
+From 13d44b1954ea15a9c92d2671bdccb5c990afa93b Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 13:15:06 +0530
+Subject: [PATCH] feat: surface 'unmarked' attendance days without penalising
+ the %
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Option B from the audit. The attendance % stays the same — late*0.5,
+half_day*0.5, holidays excluded. But now we also surface a separate
+'unmarked' count: days that should have been marked but aren't.
+
+If a teacher / admin forgot to mark someone for 7 of the 22 working
+days, the % still reads against the 15 marked days (so the staff
+isn't unfairly penalised), but the summary now also includes:
+
+  expected: 22   ← weekdays minus holidays in the period, capped at today
+  unmarked: 7    ← expected − total_records
+
+New private helper expectedWorkingDays(\$from, \$to, \$schoolId):
+  - Counts weekdays from period start to min(period_end, today)
+  - Skips Sundays (default school week is Mon–Sat)
+  - Subtracts declared holidays in the same range
+  - Returns 0 if the period is entirely in the future
+
+Both attendance summary builders updated:
+  MobileApiController::attendance() teacher branch
+  MobileApiController::attendance() student/parent branch
+
+Frontend will display "X days not yet marked — ask admin/school to
+update" when unmarked > 0.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/Api/MobileApiController.php   | 40 +++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index a8c9756..82f76c6 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -532,6 +532,11 @@ public function attendance(Request $request): JsonResponse
+             $summary['attendance_pct']  = $workingDays > 0
+                 ? round(($summary['present'] + $summary['late'] * 0.5 + $summary['half_day'] * 0.5) / $workingDays * 100, 1)
+                 : 0;
++            // Surface days that should have been marked but weren't (Option B —
++            // doesn't penalise the % calc, just makes the gap visible).
++            $expected            = $this->expectedWorkingDays($from, $to, $school->id);
++            $summary['expected'] = $expected;
++            $summary['unmarked'] = max(0, $expected - $summary['total']);
+ 
+             $dateFmt = $school->dateFmt();
+             return response()->json([
+@@ -571,6 +576,10 @@ public function attendance(Request $request): JsonResponse
+         $summary['attendance_pct'] = $workingDays > 0
+             ? round(($summary['present'] + $summary['late'] * 0.5 + $summary['half_day'] * 0.5) / $workingDays * 100, 1)
+             : 100;
++        // Days that should have been marked but weren't.
++        $expected            = $this->expectedWorkingDays($from, $to, $school->id);
++        $summary['expected'] = $expected;
++        $summary['unmarked'] = max(0, $expected - $summary['total']);
+ 
+         $dateFmt = $school->dateFmt();
+         return response()->json([
+@@ -1186,6 +1195,37 @@ public function registerDevice(Request $request): JsonResponse
+ 
+     // ── Helpers ───────────────────────────────────────────────────────────────
+ 
++    /**
++     * Count working days between two dates (inclusive), capped at today, with
++     * Sundays and declared school holidays subtracted. Used to surface an
++     * "unmarked" gap on attendance summaries — days that should have had a
++     * record but don't. Doesn't penalise the % calculation; just makes the
++     * gap visible (Option B from the audit).
++     *
++     * @param  \Carbon\Carbon  $from
++     * @param  \Carbon\Carbon  $to
++     * @param  int             $schoolId
++     */
++    private function expectedWorkingDays($from, $to, int $schoolId): int
++    {
++        $today = now()->startOfDay();
++        $end   = $to->copy()->lte($today) ? $to->copy() : $today;
++        if ($end->lt($from)) return 0;
++
++        $workingDays = 0;
++        for ($d = $from->copy(); $d->lte($end); $d->addDay()) {
++            // Treat Sunday as the only weekend by default.
++            if (!$d->isSunday()) $workingDays++;
++        }
++
++        $holidayCount = Holiday::where('school_id', $schoolId)
++            ->whereDate('date', '>=', $from->toDateString())
++            ->whereDate('date', '<=', $end->toDateString())
++            ->count();
++
++        return max(0, $workingDays - $holidayCount);
++    }
++
+     /**
+      * Resolve which student's data to serve.
+      * For parents with multiple children, honour the X-Active-Student-Id header
+-- 
+2.52.0.windows.1
+

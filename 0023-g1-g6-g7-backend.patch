@@ -1,0 +1,253 @@
+From f2e19e454f2a64092f8b99cdb6e9b246370123a0 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 12:50:51 +0530
+Subject: [PATCH] =?UTF-8?q?fix:=20G6/G7=20+=20leaveTypes=20balance=20?=
+ =?UTF-8?q?=E2=80=94=20backend?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+G7 — expose marked_by on attendance records
+  /mobile/attendance now eager-loads markedBy:id,name and includes
+  marked_by in the response for both teacher (staff_attendances) and
+  student/parent (attendances) branches.
+
+G6 — leave-balance enforcement on apply
+  applyLeave (student) and applyStaffLeave both now check days_allowed
+  vs days_used in the current academic year before creating the row.
+  If the new request would exceed the balance, returns 422 with a
+  helpful message + balance breakdown. days_allowed=0 means unlimited
+  (skip the check).
+
+Bonus fix while I was in there — leaveTypes (student) was using
+SQLite-only julianday() syntax in selectRaw, which silently returned 0
+on MySQL production deployments so balance always looked full. Now
+counts days in PHP using Carbon::diffInDays, matching the staff
+implementation.
+
+G1 — staff punch accepts remarks
+  staffPunchClockIn / staffPunchClockOut now both validate an optional
+  remarks (max 255). Clock-in stores it on the row; clock-out appends
+  to the existing remarks with " · " separator so both halves of the
+  day are visible.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/Api/MobileApiController.php   | 118 +++++++++++++++---
+ 1 file changed, 102 insertions(+), 16 deletions(-)
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index 54140a8..a8c9756 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -512,8 +512,9 @@ public function attendance(Request $request): JsonResponse
+             $records = StaffAttendance::where('school_id', $school->id)
+                 ->where('staff_id', $user->staff->id)
+                 ->whereBetween('date', [$from, $to])
++                ->with('markedBy:id,name')
+                 ->orderBy('date')
+-                ->get(['date', 'status', 'remarks']);
++                ->get(['id', 'date', 'status', 'remarks', 'marked_by']);
+ 
+             $summary = [
+                 'present'  => $records->where('status', 'present')->count(),
+@@ -536,9 +537,10 @@ public function attendance(Request $request): JsonResponse
+             return response()->json([
+                 'summary' => $summary,
+                 'records' => $records->map(fn($r) => [
+-                    'date'    => optional($r->date)->format($dateFmt),
+-                    'status'  => $r->status,
+-                    'remarks' => $r->remarks,
++                    'date'      => optional($r->date)->format($dateFmt),
++                    'status'    => $r->status,
++                    'remarks'   => $r->remarks,
++                    'marked_by' => $r->markedBy?->name,
+                 ]),
+             ]);
+         }
+@@ -550,8 +552,9 @@ public function attendance(Request $request): JsonResponse
+ 
+         $records = Attendance::where('student_id', $studentId)
+             ->whereBetween('date', [$from, $to])
++            ->with('markedBy:id,name')
+             ->orderBy('date')
+-            ->get(['date', 'status', 'remarks']);
++            ->get(['id', 'date', 'status', 'remarks', 'marked_by']);
+ 
+         $summary = [
+             'present'        => $records->where('status', 'present')->count(),
+@@ -575,9 +578,10 @@ public function attendance(Request $request): JsonResponse
+             'records'    => $records->map(fn($r) => [
+                 // Attendance.date has no Eloquent cast (kept as raw "Y-m-d" so
+                 // WHERE date = … lookups work), so parse before formatting.
+-                'date'    => $r->date ? Carbon::parse($r->date)->format($dateFmt) : null,
+-                'status'  => $r->status,
+-                'remarks' => $r->remarks,
++                'date'      => $r->date ? Carbon::parse($r->date)->format($dateFmt) : null,
++                'status'    => $r->status,
++                'remarks'   => $r->remarks,
++                'marked_by' => $r->markedBy?->name,
+             ]),
+             'student_id' => $studentId,
+         ]);
+@@ -1625,13 +1629,20 @@ public function leaveTypes(Request $request): JsonResponse
+                 }
+             }
+ 
++            // PHP-side day counting — works on MySQL, SQLite, Postgres alike.
++            // The previous julianday() approach was SQLite-only and silently
++            // returned 0 on MySQL production deployments.
+             $usedLeaves = (clone $usedQuery)
+-                ->selectRaw("leave_type_id, SUM(CAST(julianday(end_date) - julianday(start_date) AS INTEGER) + 1) as days_used")
+-                ->groupBy('leave_type_id')
+-                ->pluck('days_used', 'leave_type_id');
++                ->get(['leave_type_id', 'start_date', 'end_date']);
++            $usedByType = [];
++            foreach ($usedLeaves as $leave) {
++                if (!$leave->leave_type_id) continue;
++                $days = Carbon::parse($leave->start_date)->diffInDays(Carbon::parse($leave->end_date)) + 1;
++                $usedByType[$leave->leave_type_id] = ($usedByType[$leave->leave_type_id] ?? 0) + $days;
++            }
+ 
+             foreach ($types as $type) {
+-                $used = (int) ($usedLeaves[$type->id] ?? 0);
++                $used = (int) ($usedByType[$type->id] ?? 0);
+                 $balance[$type->id] = [
+                     'allowed'   => $type->days_allowed,
+                     'used'      => $used,
+@@ -1804,6 +1815,38 @@ public function applyLeave(Request $request): JsonResponse
+                     ], 422);
+                 }
+             }
++
++            // Balance check — reject if this application would exceed days_allowed
++            if ($leaveType->days_allowed > 0) {
++                $requestedDays = Carbon::parse($validated['start_date'])
++                    ->diffInDays(Carbon::parse($validated['end_date'])) + 1;
++
++                $yearId = app()->bound('current_academic_year_id') ? app('current_academic_year_id') : null;
++                $usedQuery = StudentLeave::where('school_id', $school->id)
++                    ->where('student_id', $student->id)
++                    ->where('leave_type_id', $leaveType->id)
++                    ->where('status', '!=', 'rejected');
++                if ($yearId) {
++                    $year = AcademicYear::find($yearId);
++                    if ($year) {
++                        $usedQuery->whereDate('start_date', '>=', $year->start_date)
++                                  ->whereDate('start_date', '<=', $year->end_date);
++                    }
++                }
++                $usedDays = 0;
++                foreach ($usedQuery->get(['start_date', 'end_date']) as $l) {
++                    $usedDays += Carbon::parse($l->start_date)->diffInDays(Carbon::parse($l->end_date)) + 1;
++                }
++                $remaining = max(0, $leaveType->days_allowed - $usedDays);
++
++                if ($requestedDays > $remaining) {
++                    return response()->json([
++                        'message' => "Insufficient leave balance. {$remaining} day(s) of {$leaveType->name} remaining; this request needs {$requestedDays}.",
++                        'errors'  => ['leave_type_id' => ["Only {$remaining} day(s) remaining."]],
++                        'balance' => ['allowed' => $leaveType->days_allowed, 'used' => $usedDays, 'remaining' => $remaining, 'requested' => $requestedDays],
++                    ], 422);
++                }
++            }
+         }
+ 
+         // Handle document upload
+@@ -4357,6 +4400,7 @@ public function staffPunchClockIn(Request $request): JsonResponse
+         $validated = $request->validate([
+             'latitude'  => 'required|numeric',
+             'longitude' => 'required|numeric',
++            'remarks'   => 'nullable|string|max:255',
+         ]);
+ 
+         $user   = $request->user();
+@@ -4407,13 +4451,14 @@ public function staffPunchClockIn(Request $request): JsonResponse
+ 
+         StaffAttendance::updateOrCreate(
+             ['school_id' => $school->id, 'staff_id' => $staff->id, 'date' => $today],
+-            [
++            array_filter([
+                 'status'       => $status,
+                 'check_in'     => $now,
+                 'punch_in_lat' => $validated['latitude'],
+                 'punch_in_lng' => $validated['longitude'],
++                'remarks'      => $validated['remarks'] ?? null,
+                 'marked_by'    => $user->id,
+-            ]
++            ], fn($v) => $v !== null)
+         );
+ 
+         $message = $status === 'late' ? 'Clocked in — marked late.' : 'Clocked in successfully!';
+@@ -4434,6 +4479,7 @@ public function staffPunchClockOut(Request $request): JsonResponse
+         $validated = $request->validate([
+             'latitude'  => 'required|numeric',
+             'longitude' => 'required|numeric',
++            'remarks'   => 'nullable|string|max:255',
+         ]);
+ 
+         $user   = $request->user();
+@@ -4483,11 +4529,18 @@ public function staffPunchClockOut(Request $request): JsonResponse
+ 
+         $now = now()->format('H:i:s');
+ 
+-        $attendance->update([
++        $update = [
+             'check_out'      => $now,
+             'punch_out_lat'  => $validated['latitude'],
+             'punch_out_lng'  => $validated['longitude'],
+-        ]);
++        ];
++        // Append clock-out remark to existing remark if both present
++        if (!empty($validated['remarks'])) {
++            $update['remarks'] = trim(
++                ($attendance->remarks ? $attendance->remarks . ' · ' : '') . $validated['remarks']
++            );
++        }
++        $attendance->update($update);
+ 
+         return response()->json([
+             'message'   => 'Clocked out successfully!',
+@@ -4738,6 +4791,39 @@ public function applyStaffLeave(Request $request): JsonResponse
+             }
+         }
+ 
++        // Balance check — reject if this application would exceed days_allowed.
++        // (days_allowed = 0 means unlimited, skip the check.)
++        if ($leaveType->days_allowed > 0) {
++            $requestedDays = Carbon::parse($validated['start_date'])
++                ->diffInDays(Carbon::parse($validated['end_date'])) + 1;
++
++            $yearId = app()->bound('current_academic_year_id') ? app('current_academic_year_id') : null;
++            $usedQuery = Leave::where('school_id', $school->id)
++                ->where('user_id', $user->id)
++                ->where('leave_type_id', $leaveType->id)
++                ->where('status', '!=', 'rejected');
++            if ($yearId) {
++                $year = \App\Models\AcademicYear::find($yearId);
++                if ($year) {
++                    $usedQuery->whereDate('start_date', '>=', $year->start_date)
++                              ->whereDate('start_date', '<=', $year->end_date);
++                }
++            }
++            $usedDays = 0;
++            foreach ($usedQuery->get(['start_date', 'end_date']) as $l) {
++                $usedDays += Carbon::parse($l->start_date)->diffInDays(Carbon::parse($l->end_date)) + 1;
++            }
++            $remaining = max(0, $leaveType->days_allowed - $usedDays);
++
++            if ($requestedDays > $remaining) {
++                return response()->json([
++                    'message' => "Insufficient leave balance. You have {$remaining} day(s) of {$leaveType->name} remaining; this request needs {$requestedDays}.",
++                    'errors'  => ['leave_type_id' => ["Only {$remaining} day(s) remaining."]],
++                    'balance' => ['allowed' => $leaveType->days_allowed, 'used' => $usedDays, 'remaining' => $remaining, 'requested' => $requestedDays],
++                ], 422);
++            }
++        }
++
+         $leave = Leave::create([
+             'school_id'     => $school->id,
+             'user_id'       => $user->id,
+-- 
+2.52.0.windows.1
+

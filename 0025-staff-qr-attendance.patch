@@ -1,0 +1,139 @@
+From fc541d9524e331cc9d9108c862eaf1e8f8940d1b Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 13:26:05 +0530
+Subject: [PATCH] feat: QR code attendance for staff
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Mirrors the existing student QR rapid-scan flow for staff. School
+management (admin / school_admin / principal / super_admin) scans a
+staff QR code (containing the employee_id) and the system marks them
+Present (or Late, based on the school's late_threshold setting).
+
+New endpoint: POST /api/mobile/staff-attendance/rapid-scan
+Body: { code: "EMP123" }
+       Also accepts "staff:EMP123" or any URL containing /staff/EMP123.
+
+Behaviour:
+- Tenant-scoped to current school
+- Permission-gated to management roles only (matches the existing
+  admin_only restriction on web staff-attendance routes)
+- Uses StaffAttendance::updateOrCreate so re-scanning the same person
+  is idempotent — useful at busy events
+- Determines Present vs Late from school.settings.late_threshold
+  (default '09:30', same logic as the geofence punch)
+- Records check_in time and marked_by user
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/Api/MobileApiController.php   | 78 +++++++++++++++++++
+ routes/api.php                                |  3 +-
+ 2 files changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index 82f76c6..af5e8eb 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -3703,6 +3703,84 @@ public function rapidScanAttendance(Request $request): JsonResponse
+         ]);
+     }
+ 
++    /**
++     * POST /mobile/staff-attendance/rapid-scan
++     * Mirrors the student rapid-scan flow for staff. Admin / principal /
++     * school_admin scans a staff QR (which encodes the employee_id) and the
++     * row is marked Present for today via updateOrCreate.
++     *
++     * QR payload formats accepted:
++     *   - bare "EMP123"
++     *   - "staff:EMP123"
++     *   - "/staff/EMP123" or any URL containing /staff/<id>
++     */
++    public function rapidScanStaffAttendance(Request $request): JsonResponse
++    {
++        $user   = $request->user();
++        $school = app('current_school');
++
++        // Only management can mark staff attendance — same gate as the web
++        // staff-attendance routes.
++        $userType = $user->user_type instanceof \BackedEnum ? $user->user_type->value : (string) $user->user_type;
++        if (!in_array($userType, ['admin', 'school_admin', 'principal', 'super_admin'])) {
++            return response()->json(['error' => 'Only school management can mark staff attendance.'], 403);
++        }
++
++        $request->validate(['code' => 'required|string|max:512']);
++        $raw = trim($request->code);
++
++        // Pull the employee_id segment out of common payloads
++        if (preg_match('~/staff/([^/?#]+)~', $raw, $m)) {
++            $code = $m[1];
++        } elseif (preg_match('~^staff:(.+)$~', $raw, $m)) {
++            $code = $m[1];
++        } else {
++            $code = $raw;
++        }
++
++        $staff = \App\Models\Staff::with(['user:id,name', 'designation:id,name'])
++            ->where('school_id', $school->id)
++            ->where('employee_id', $code)
++            ->where('status', 'active')
++            ->first();
++
++        if (!$staff) {
++            return response()->json(['error' => 'Staff not found or inactive.'], 404);
++        }
++
++        // Determine late vs present using the school's late_threshold setting
++        $lateThreshold = $school->settings['late_threshold'] ?? '09:30';
++        $now           = now()->format('H:i:s');
++        $status        = Carbon::parse($now)->gt(Carbon::parse($lateThreshold)) ? 'late' : 'present';
++
++        StaffAttendance::updateOrCreate(
++            [
++                'school_id' => $school->id,
++                'staff_id'  => $staff->id,
++                'date'      => now()->toDateString(),
++            ],
++            [
++                'status'    => $status,
++                'check_in'  => $now,
++                'marked_by' => $user->id,
++            ]
++        );
++
++        return response()->json([
++            'success'   => true,
++            'message'   => $status === 'late' ? 'Marked Late.' : 'Marked Present.',
++            'staff'     => [
++                'id'          => $staff->id,
++                'employee_id' => $staff->employee_id,
++                'name'        => $staff->user?->name ?? 'Unknown',
++                'designation' => $staff->designation?->name ?? '',
++                'photo_url'   => $this->publicFileUrl($staff->photo ?? null),
++            ],
++            'status'    => $status,
++            'timestamp' => now()->format('Y-m-d H:i:s'),
++        ]);
++    }
++
+     /**
+      * POST /mobile/students/lookup-by-uuid
+      * Resolves a scanned student QR (raw uuid or "/q/<uuid>" url) to the
+diff --git a/routes/api.php b/routes/api.php
+index f393bf6..04c222a 100644
+--- a/routes/api.php
++++ b/routes/api.php
+@@ -222,7 +222,8 @@
+     Route::get('/attendance/students',    [$MA, 'attendanceStudents'])->name('api.mobile.attendance.students');
+     Route::post('/attendance/mark',       [$MA, 'markAttendance'])->name('api.mobile.attendance.mark');
+     Route::get('/attendance/report',      [$MA, 'attendanceReport'])->name('api.mobile.attendance.report');
+-    Route::post('/attendance/rapid-scan', [$MA, 'rapidScanAttendance'])->name('api.mobile.attendance.rapid-scan');
++    Route::post('/attendance/rapid-scan',       [$MA, 'rapidScanAttendance'])->name('api.mobile.attendance.rapid-scan');
++    Route::post('/staff-attendance/rapid-scan', [$MA, 'rapidScanStaffAttendance'])->name('api.mobile.staff-attendance.rapid-scan');
+ 
+     // AI Insights (admin-only; delegates to AiInsightsController)
+     Route::get('/ai/insights',  [$MA, 'aiInsights'])->name('api.mobile.ai.insights');
+-- 
+2.52.0.windows.1
+

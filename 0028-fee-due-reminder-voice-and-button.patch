@@ -1,0 +1,259 @@
+From 07a2d13cab6966ebdfee656252e4dda3b14ac0f5 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 15:08:36 +0530
+Subject: [PATCH] =?UTF-8?q?feat:=20fee=20due=20reminder=20=E2=80=94=20voic?=
+ =?UTF-8?q?e=20channel=20+=20manual=20send=20button?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- fee_due_reminder template now seeds for voice (was sms/whatsapp only)
+- notifyFeeDue() fires voice call alongside SMS/WhatsApp
+- New "Send Reminder" button per row + "Send All Reminders" bulk action on
+  the due report page; balance is recomputed server-side before sending
+- New POST /school/finance/due-report/send-reminder endpoint
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../CommunicationTemplateController.php       |  3 +-
+ .../School/Finance/LedgerController.php       | 90 +++++++++++++++++++
+ app/Services/NotificationService.php          | 10 ++-
+ .../Pages/School/Finance/Ledger/DueReport.vue | 49 +++++++++-
+ routes/web.php                                |  1 +
+ 5 files changed, 149 insertions(+), 4 deletions(-)
+
+diff --git a/app/Http/Controllers/School/CommunicationTemplateController.php b/app/Http/Controllers/School/CommunicationTemplateController.php
+index 31655be..eb665b4 100644
+--- a/app/Http/Controllers/School/CommunicationTemplateController.php
++++ b/app/Http/Controllers/School/CommunicationTemplateController.php
+@@ -42,10 +42,11 @@ class CommunicationTemplateController extends Controller
+         'fee_due_reminder' => [
+             'name'      => 'Fee Due Reminder',
+             'variables' => ['name', 'amount', 'date', 'course_name', 'batch_name'],
+-            'channels'  => ['sms', 'whatsapp'],
++            'channels'  => ['sms', 'whatsapp', 'voice'],
+             'defaults'  => [
+                 'sms'      => 'Dear Parent, fee of Rs.##AMOUNT## is due for ##NAME## (##COURSE_NAME##) by ##DATE##. Please pay at the earliest.',
+                 'whatsapp' => 'Dear Parent, fee of Rs.##AMOUNT## is due for ##NAME## (##COURSE_NAME##) by ##DATE##. Please pay at the earliest.',
++                'voice'    => 'Dear parent, fee of rupees ##AMOUNT## is due for ##NAME## by ##DATE##. Please pay at the earliest.',
+             ],
+         ],
+         'otp' => [
+diff --git a/app/Http/Controllers/School/Finance/LedgerController.php b/app/Http/Controllers/School/Finance/LedgerController.php
+index 94c4958..298fa7a 100644
+--- a/app/Http/Controllers/School/Finance/LedgerController.php
++++ b/app/Http/Controllers/School/Finance/LedgerController.php
+@@ -189,6 +189,96 @@ public function dueReport(Request $request)
+         ]);
+     }
+ 
++    /**
++     * Send Fee Due Reminder
++     * Triggers SMS / WhatsApp / Voice reminders to parents of selected students.
++     * Channels actually fired depend on which fee_due_reminder templates the
++     * school has configured as active. Recomputes balance server-side so the
++     * amount in the message is always current.
++     */
++    public function sendDueReminder(Request $request)
++    {
++        $validated = $request->validate([
++            'student_ids'   => 'required|array|min:1',
++            'student_ids.*' => 'integer|exists:students,id',
++            'due_date'      => 'nullable|string|max:50',
++        ]);
++
++        $schoolId       = app('current_school_id');
++        $academicYearId = app('current_academic_year_id');
++        $school         = app('current_school');
++        $dueDate        = $validated['due_date'] ?? now()->format('d-M-Y');
++
++        $students = Student::where('school_id', $schoolId)
++            ->whereIn('id', $validated['student_ids'])
++            ->whereHas('currentAcademicHistory', fn($q) => $q->where('academic_year_id', $academicYearId))
++            ->with(['currentAcademicHistory.courseClass', 'currentAcademicHistory.section', 'studentParent'])
++            ->get();
++
++        $feeStructures = \App\Models\FeeStructure::where('school_id', $schoolId)
++            ->where('academic_year_id', $academicYearId)
++            ->get();
++
++        $studentIds = $students->pluck('id');
++
++        $paymentTotals = FeePayment::where('school_id', $schoolId)
++            ->where('academic_year_id', $academicYearId)
++            ->whereIn('student_id', $studentIds)
++            ->selectRaw('student_id, SUM(amount_paid) as total_paid, SUM(discount) as total_discount')
++            ->groupBy('student_id')
++            ->get()
++            ->keyBy('student_id');
++
++        $historyCounts = \App\Models\StudentAcademicHistory::whereIn('student_id', $studentIds)
++            ->selectRaw('student_id, count(*) as count')
++            ->groupBy('student_id')
++            ->pluck('count', 'student_id');
++
++        $notifier = new \App\Services\NotificationService($school);
++
++        $sent = 0;
++        $skippedNoPhone = 0;
++        $skippedNoBalance = 0;
++
++        foreach ($students as $student) {
++            $history = $student->currentAcademicHistory;
++            if (!$history) { $skippedNoBalance++; continue; }
++
++            $studentType = ($historyCounts[$student->id] ?? 1) > 1 ? 'old' : 'new';
++            $gender      = strtolower($student->gender);
++
++            $totalDue = $feeStructures->filter(function ($s) use ($history, $studentType, $gender) {
++                if ($s->class_id != $history->class_id) return false;
++                if ($s->student_type !== 'all' && $s->student_type !== $studentType) return false;
++                if ($s->gender !== 'all' && strtolower($s->gender) !== $gender) return false;
++                return true;
++            })->sum('amount');
++
++            $pt        = $paymentTotals->get($student->id);
++            $totalPaid = (float) ($pt->total_paid     ?? 0);
++            $discount  = (float) ($pt->total_discount ?? 0);
++            $balance   = max(0, $totalDue - $totalPaid - $discount);
++
++            if ($balance <= 0) { $skippedNoBalance++; continue; }
++
++            $parent = $student->studentParent;
++            if (!$parent || !$parent->primary_phone) { $skippedNoPhone++; continue; }
++
++            $notifier->notifyFeeDue($student, number_format($balance, 2, '.', ''), $dueDate);
++            $sent++;
++        }
++
++        return response()->json([
++            'success'             => true,
++            'sent'                => $sent,
++            'skipped_no_phone'    => $skippedNoPhone,
++            'skipped_no_balance'  => $skippedNoBalance,
++            'message'             => "Reminders queued for {$sent} parent(s)."
++                                   . ($skippedNoPhone ? " {$skippedNoPhone} skipped (no phone)." : '')
++                                   . ($skippedNoBalance ? " {$skippedNoBalance} skipped (no balance)." : ''),
++        ]);
++    }
++
+     /**
+      * Fee Summary Report
+      * Shows S.No, Admission No, Student, Father, Class, Total Due, Concession, Payable, Paid, Balance.
+diff --git a/app/Services/NotificationService.php b/app/Services/NotificationService.php
+index 85c5827..8d1e110 100644
+--- a/app/Services/NotificationService.php
++++ b/app/Services/NotificationService.php
+@@ -447,8 +447,9 @@ public function notifyFeeDue($student, $amount, $dueDate)
+         $parent = $student->studentParent;
+         if (!$parent || !$parent->primary_phone) return;
+ 
+-        $smsTemplate = $this->getTemplate('sms', 'fee_due_reminder');
+-        $waTemplate  = $this->getTemplate('whatsapp', 'fee_due_reminder');
++        $smsTemplate   = $this->getTemplate('sms', 'fee_due_reminder');
++        $waTemplate    = $this->getTemplate('whatsapp', 'fee_due_reminder');
++        $voiceTemplate = $this->getTemplate('voice', 'fee_due_reminder');
+ 
+         $data = [
+             'name'        => $student->name,
+@@ -467,6 +468,11 @@ public function notifyFeeDue($student, $amount, $dueDate)
+             $orderedParams = $this->extractOrderedWhatsAppParams($waTemplate->content, $data);
+             $this->sendWhatsApp($parent->primary_phone, $waTemplate->template_id, $orderedParams, $parent->user_id, $waTemplate->language_code ?? 'en');
+         }
++
++        if ($voiceTemplate) {
++            $message = $this->replacePlaceholders($voiceTemplate->content, $data);
++            $this->sendVoiceCall($parent->primary_phone, $voiceTemplate->audio_url, $message, $parent->user_id);
++        }
+     }
+ 
+     /**
+diff --git a/resources/js/Pages/School/Finance/Ledger/DueReport.vue b/resources/js/Pages/School/Finance/Ledger/DueReport.vue
+index e26c4b1..a1d612c 100644
+--- a/resources/js/Pages/School/Finance/Ledger/DueReport.vue
++++ b/resources/js/Pages/School/Finance/Ledger/DueReport.vue
+@@ -65,6 +65,36 @@ onMounted(() => {
+ const formatCurrency = (amount) => {
+     return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' }).format(amount);
+ };
++
++// ── Reminder dispatch ────────────────────────────────────────────────────────
++const sendingFor  = ref(null);   // student_id while a single send is in flight
++const sendingBulk = ref(false);
++
++async function sendReminder(studentIds, label) {
++    try {
++        const { data } = await axios.post(
++            route('school.finance.due-report.send-reminder'),
++            { student_ids: studentIds }
++        );
++        alert(data.message ?? `Reminders sent to ${label}.`);
++    } catch (e) {
++        alert(e.response?.data?.message ?? 'Could not send reminders.');
++    }
++}
++
++async function sendOne(student) {
++    sendingFor.value = student.student_id;
++    await sendReminder([student.student_id], student.name);
++    sendingFor.value = null;
++}
++
++async function sendAll() {
++    if (props.defaulters.length === 0) return;
++    if (!confirm(`Send fee due reminders to ${props.defaulters.length} parent(s)? This will trigger SMS / WhatsApp / Voice based on your active templates.`)) return;
++    sendingBulk.value = true;
++    await sendReminder(props.defaulters.map(d => d.student_id), `${props.defaulters.length} parent(s)`);
++    sendingBulk.value = false;
++}
+ </script>
+ 
+ <template>
+@@ -76,6 +106,13 @@ const formatCurrency = (amount) => {
+                 <p class="page-header-sub">Students with outstanding fee balances for the current academic year.</p>
+             </div>
+             <div class="flex items-center gap-3">
++                <Button
++                    variant="primary"
++                    :disabled="sendingBulk || defaulters.length === 0"
++                    @click="sendAll"
++                >
++                    {{ sendingBulk ? 'Sending…' : `📣 Send All Reminders${defaulters.length ? ` (${defaulters.length})` : ''}` }}
++                </Button>
+                 <Button variant="secondary" onclick="window.print()">🖨️ Print List</Button>
+             </div>
+         </div>
+@@ -137,7 +174,17 @@ const formatCurrency = (amount) => {
+                                 {{ formatCurrency(student.balance_due) }}
+                             </td>
+                             <td class="text-center print:hidden">
+-                                <Button size="xs" as="a" :href="`/school/fee/collect?student_id=${student.student_id}`">Pay Now</Button>
++                                <div class="flex items-center justify-center gap-2">
++                                    <Button size="xs" as="a" :href="`/school/fee/collect?student_id=${student.student_id}`">Pay Now</Button>
++                                    <Button
++                                        size="xs"
++                                        variant="secondary"
++                                        :disabled="sendingFor === student.student_id"
++                                        @click="sendOne(student)"
++                                    >
++                                        {{ sendingFor === student.student_id ? '…' : '📣 Remind' }}
++                                    </Button>
++                                </div>
+                             </td>
+                         </tr>
+                         <tr v-if="defaulters.length === 0">
+diff --git a/routes/web.php b/routes/web.php
+index 941ba04..e45747b 100644
+--- a/routes/web.php
++++ b/routes/web.php
+@@ -398,6 +398,7 @@
+             $LC = \App\Http\Controllers\School\Finance\LedgerController::class;
+             Route::get('finance/day-book', [$LC, 'dayBook'])->name('finance.day-book');
+             Route::get('finance/due-report', [$LC, 'dueReport'])->name('finance.due-report');
++            Route::post('finance/due-report/send-reminder', [$LC, 'sendDueReminder'])->name('finance.due-report.send-reminder');
+             Route::get('finance/fee-summary', [$LC, 'feeSummaryReport'])->name('finance.fee-summary');
+             Route::get('finance/reports', [\App\Http\Controllers\School\Finance\ReportController::class, 'index'])->name('finance.reports.index');
+         });
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,286 @@
+From a3d1ce489ddeed0e725ddaa2ec599e901c1a8947 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 19:24:49 +0530
+Subject: [PATCH] =?UTF-8?q?feat:=20gate=20keeper=20mobile=20API=20?=
+ =?UTF-8?q?=E2=80=94=20gate=20passes=20+=20visitor=20log?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wires up the front gate keeper mobile app, which previously had a UI
+shell but no functional backend (every call 404'd).
+
+- gateStats() → GET /mobile/front-office/gate/stats — entries today,
+  exits today, visitors in (still on campus), visitors today, open
+  passes (Approved/Exited).
+- verifyGatePass(token) → GET /mobile/front-office/gate-passes/verify/
+  {token} — looks up the pass by QR token, returns holder + status +
+  the next valid action (exit/entry) so the mobile UI doesn't have to
+  encode the state machine.
+- gatePassExit(id) / gatePassEntry(id) → POST endpoints that perform
+  the Approved → Exited and Exited → Returned transitions and stamp
+  exit_time / return_time. Invalid transitions return 422.
+- visitorList() → GET /mobile/front-office/visitors — most-recent-first
+  list (capped 100), supports ?today=1 filter.
+- logVisitor() → POST /mobile/front-office/visitors — walk-in entry
+  (validates name + purpose; in_time = now).
+- visitorExit(id) → POST .../visitors/{id}/exit — sets out_time = now;
+  rejects double-exit.
+
+Pure controller + routes — no migration. School scope enforced via
+school_id on every query.
+
+Mobile half (QR scanner, log-visitor screen, refresh, notifications
+tab) ships with the next Expo build.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/Api/MobileApiController.php   | 211 ++++++++++++++++++
+ routes/api.php                                |   9 +
+ 2 files changed, 220 insertions(+)
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index fcda381..35e8e45 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -1056,6 +1056,217 @@ public function transportAttendanceMark(Request $request): JsonResponse
+         return response()->json(['success' => true, 'saved' => $saved]);
+     }
+ 
++    // ── Front gate keeper (gate passes + visitor log) ────────────────────────
++
++    /**
++     * GET /mobile/front-office/gate/stats
++     * Today's counts for the gate keeper dashboard.
++     */
++    public function gateStats(Request $request): JsonResponse
++    {
++        $school = app('current_school');
++        $today  = now()->toDateString();
++
++        $exitsToday = \App\Models\GatePass::where('school_id', $school->id)
++            ->whereDate('exit_time', $today)->count();
++        $entriesToday = \App\Models\GatePass::where('school_id', $school->id)
++            ->whereDate('return_time', $today)->count();
++        $openPasses = \App\Models\GatePass::where('school_id', $school->id)
++            ->whereIn('status', ['Approved', 'Exited'])->count();
++
++        $visitorsIn = \App\Models\VisitorLog::where('school_id', $school->id)
++            ->whereDate('in_time', $today)
++            ->whereNull('out_time')->count();
++        $visitorsToday = \App\Models\VisitorLog::where('school_id', $school->id)
++            ->whereDate('in_time', $today)->count();
++
++        return response()->json([
++            'entries_today'  => $entriesToday,
++            'exits_today'    => $exitsToday,
++            'visitors_in'    => $visitorsIn,
++            'visitors_today' => $visitorsToday,
++            'open_passes'    => $openPasses,
++        ]);
++    }
++
++    /**
++     * GET /mobile/front-office/gate-passes/verify/{token}
++     * Resolve a gate pass by its QR token. Includes the next valid action
++     * (exit / entry) for the current status so the mobile UI doesn't have
++     * to encode the state machine.
++     */
++    public function verifyGatePass(Request $request, string $token): JsonResponse
++    {
++        $school = app('current_school');
++
++        $pass = \App\Models\GatePass::where('school_id', $school->id)
++            ->where('qr_code_token', $token)
++            ->with([
++                'user',
++                'requestedBy',
++                'verifiedBy:id,name',
++            ])
++            ->first();
++
++        if (!$pass) {
++            return response()->json(['valid' => false, 'message' => 'Gate pass not found.'], 404);
++        }
++
++        // Resolve the holder name from the polymorphic user relationship
++        $holderName = $pass->user?->name
++            ?? $pass->user?->first_name
++            ?? $pass->picked_up_by_name
++            ?? '—';
++
++        return response()->json([
++            'valid'        => true,
++            'id'           => $pass->id,
++            'status'       => strtolower($pass->status),                  // pending|approved|exited|returned|rejected
++            'pass_type'    => $pass->pass_type,
++            'holder_name'  => $holderName,
++            'reason'       => $pass->reason,
++            'relationship' => $pass->relationship,
++            'exit_time'    => optional($pass->exit_time)->toDateTimeString(),
++            'return_time'  => optional($pass->return_time)->toDateTimeString(),
++            'verified_by'  => $pass->verifiedBy?->name,
++            'next_action'  => match ($pass->status) {
++                'Approved' => 'exit',     // student is on campus → leaving
++                'Exited'   => 'entry',    // student is outside  → returning
++                default    => null,        // Pending / Rejected / Returned → no action
++            },
++        ]);
++    }
++
++    /**
++     * POST /mobile/front-office/gate-passes/{id}/exit
++     * Records exit_time. Status transitions Approved → Exited.
++     */
++    public function gatePassExit(Request $request, int $id): JsonResponse
++    {
++        return $this->gatePassTransition($id, 'Exited');
++    }
++
++    /**
++     * POST /mobile/front-office/gate-passes/{id}/entry
++     * Records return_time. Status transitions Exited → Returned.
++     */
++    public function gatePassEntry(Request $request, int $id): JsonResponse
++    {
++        return $this->gatePassTransition($id, 'Returned');
++    }
++
++    private function gatePassTransition(int $id, string $newStatus): JsonResponse
++    {
++        $school = app('current_school');
++        $pass   = \App\Models\GatePass::where('school_id', $school->id)->find($id);
++        if (!$pass) return response()->json(['message' => 'Gate pass not found.'], 404);
++
++        $allowed = match ($pass->status) {
++            'Pending'  => ['Approved', 'Rejected'],
++            'Approved' => ['Exited', 'Rejected'],
++            'Exited'   => ['Returned'],
++            default    => [],
++        };
++        if (!in_array($newStatus, $allowed)) {
++            return response()->json([
++                'message' => "Cannot change status from {$pass->status} to {$newStatus}.",
++            ], 422);
++        }
++
++        $pass->status = $newStatus;
++        if ($newStatus === 'Exited')   $pass->exit_time   = now();
++        if ($newStatus === 'Returned') $pass->return_time = now();
++        $pass->save();
++
++        return response()->json([
++            'success' => true,
++            'status'  => strtolower($newStatus),
++        ]);
++    }
++
++    /**
++     * GET /mobile/front-office/visitors
++     * List visitor logs. ?today=1 restricts to today only.
++     * Default sort: most recent first (newest in_time on top).
++     */
++    public function visitorList(Request $request): JsonResponse
++    {
++        $school = app('current_school');
++
++        $query = \App\Models\VisitorLog::where('school_id', $school->id);
++
++        if ($request->boolean('today')) {
++            $today = now()->toDateString();
++            $query->whereDate('in_time', $today);
++        }
++
++        $visitors = $query->orderByDesc('in_time')
++            ->limit(100)
++            ->get(['id', 'name', 'phone', 'purpose', 'in_time', 'out_time', 'badge_number', 'photo_path'])
++            ->map(fn ($v) => [
++                'id'           => $v->id,
++                'name'         => $v->name,
++                'phone'        => $v->phone,
++                'purpose'      => $v->purpose,
++                'badge_number' => $v->badge_number,
++                'entry_time'   => optional($v->in_time)->format('H:i'),
++                'exit_time'    => optional($v->out_time)->format('H:i'),
++                'in_time'      => optional($v->in_time)->toDateTimeString(),
++                'out_time'     => optional($v->out_time)->toDateTimeString(),
++            ])
++            ->values();
++
++        return response()->json([
++            'data'  => $visitors,
++            'total' => $visitors->count(),
++        ]);
++    }
++
++    /**
++     * POST /mobile/front-office/visitors
++     * Log a walk-in visitor (in_time = now).
++     */
++    public function logVisitor(Request $request): JsonResponse
++    {
++        $user   = $request->user();
++        $school = app('current_school');
++
++        $validated = $request->validate([
++            'name'     => 'required|string|max:255',
++            'phone'    => 'nullable|string|max:20',
++            'purpose'  => 'required|in:Meeting,Admission,Delivery,Other',
++            'notes'    => 'nullable|string|max:1000',
++            'badge_number' => 'nullable|string|max:50',
++        ]);
++
++        $visitor = new \App\Models\VisitorLog($validated);
++        $visitor->school_id = $school->id;
++        $visitor->academic_year_id = app()->bound('current_academic_year_id') ? app('current_academic_year_id') : null;
++        $visitor->in_time = now();
++        $visitor->save();
++
++        return response()->json([
++            'success' => true,
++            'id'      => $visitor->id,
++            'message' => 'Visitor logged.',
++        ], 201);
++    }
++
++    /**
++     * POST /mobile/front-office/visitors/{id}/exit
++     * Sets out_time = now.
++     */
++    public function visitorExit(Request $request, int $id): JsonResponse
++    {
++        $school  = app('current_school');
++        $visitor = \App\Models\VisitorLog::where('school_id', $school->id)->find($id);
++        if (!$visitor) return response()->json(['message' => 'Visitor not found.'], 404);
++        if ($visitor->out_time) return response()->json(['message' => 'Visitor already exited.'], 422);
++
++        $visitor->update(['out_time' => now()]);
++        return response()->json(['success' => true, 'out_time' => $visitor->out_time->toDateTimeString()]);
++    }
++
+     // ── Announcements ─────────────────────────────────────────────────────────
+ 
+     public function announcements(Request $request): JsonResponse
+diff --git a/routes/api.php b/routes/api.php
+index 2d728dc..3926364 100644
+--- a/routes/api.php
++++ b/routes/api.php
+@@ -122,6 +122,15 @@
+     Route::post('/transport/attendance/mark',         [$MA, 'transportAttendanceMark'])->name('api.mobile.transport.attendance.mark');
+     Route::get('/announcements',              [$MA, 'announcements'])->name('api.mobile.announcements');
+ 
++    // Front gate keeper — gate passes + visitor log
++    Route::get ('/front-office/gate/stats',                       [$MA, 'gateStats'])->name('api.mobile.front-office.gate.stats');
++    Route::get ('/front-office/gate-passes/verify/{token}',       [$MA, 'verifyGatePass'])->where('token', '[A-Za-z0-9_\-]+')->name('api.mobile.front-office.gate-passes.verify');
++    Route::post('/front-office/gate-passes/{id}/exit',            [$MA, 'gatePassExit'])->whereNumber('id')->name('api.mobile.front-office.gate-passes.exit');
++    Route::post('/front-office/gate-passes/{id}/entry',           [$MA, 'gatePassEntry'])->whereNumber('id')->name('api.mobile.front-office.gate-passes.entry');
++    Route::get ('/front-office/visitors',                          [$MA, 'visitorList'])->name('api.mobile.front-office.visitors');
++    Route::post('/front-office/visitors',                          [$MA, 'logVisitor'])->name('api.mobile.front-office.visitors.log');
++    Route::post('/front-office/visitors/{id}/exit',                [$MA, 'visitorExit'])->whereNumber('id')->name('api.mobile.front-office.visitors.exit');
++
+     // Multi-child (parent)
+     Route::get('/children',                   [$MA, 'children'])->name('api.mobile.children');
+ 
+-- 
+2.52.0.windows.1
+

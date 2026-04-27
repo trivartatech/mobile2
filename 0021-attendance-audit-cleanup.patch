@@ -1,0 +1,360 @@
+From aeecd19154451db38ed073cc679cc64ac94d56d2 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 11:47:33 +0530
+Subject: [PATCH] =?UTF-8?q?fix:=20attendance=20audit=20cleanup=20=E2=80=94?=
+ =?UTF-8?q?=20formula,=20scope,=20calendar,=20enum,=20dashboard,=20notify?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Six fixes addressing the staff+student attendance audit:
+
+B2 — Status enum mismatch.
+  attendances.status was missing 'holiday' that staff_attendances had
+  and the mobile UI offered. Added migration adding 'holiday' to the
+  enum + accepted in both AttendanceController validation and
+  MobileApiController validation.
+
+B3 — Attendance % formula was inconsistent across the app.
+  Five different formulas for the same metric. Standardised on
+  (present + late*0.5 + half_day*0.5) / total — late and half_day
+  count as half-credit. Touched:
+    Api/MobileApiController.php (teacher branch, parent branch,
+      stats helper, attendance summary)
+    Api/Mobile/AttendanceController.php
+    Export/AttendanceExportController.php (note: still no half_day
+      column in this exporter, applied to late only)
+
+B4 — Staff monthly report calendar misalignment.
+  StaffAttendanceController::report() was building day keys with
+  \$byDate->first()?->date->year — so a staff member whose only
+  record was on day 28 had the entire calendar built around that
+  one record's year/month. Now uses \$startDate->year/month
+  (the requested month) directly.
+
+M1 — Staff attendance scope gap.
+  staff-attendance.index/store/report routes were on the default
+  school.management middleware, which lets teachers through. Now
+  gated by school.management:admin_only — only admin / school_admin
+  / principal / super_admin can mark or view all staff attendance.
+
+M3 — Dashboard was missing student_unmarked_today.
+  Mirrors the staff_unmarked_today field added last commit. The
+  attendance bento tile on the dashboard now shows "Not marked yet"
+  in amber when 0 records exist for the day, and "X unmarked" along
+  with present/absent counts when partial.
+
+M4 — Parent absence notifications were opt-in.
+  AttendanceController::store() only fired notifications when the
+  client passed send_notifications=true. Now defaults to ON via the
+  new school setting notifications_v2.attendance_auto_notify (true
+  by default). Schools that don't want auto-notify can flip the
+  setting; clients can still send_notifications=false to opt-out
+  per-request.
+
+M2 (auto-fill on declared holidays) intentionally deferred — it's
+bigger work needing a daily scheduled job, and the enum addition
+above is a prerequisite anyway.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Api/Mobile/AttendanceController.php       |  3 +-
+ .../Controllers/Api/MobileApiController.php   | 40 ++++++++++++-------
+ app/Http/Controllers/DashboardController.php  | 14 ++++---
+ .../School/AttendanceController.php           | 16 ++++++--
+ .../Export/AttendanceExportController.php     |  4 +-
+ .../School/StaffAttendanceController.php      |  7 +++-
+ ..._add_holiday_to_attendance_status_enum.php | 27 +++++++++++++
+ resources/js/Pages/School/Dashboard.vue       | 10 ++++-
+ routes/web.php                                | 11 +++--
+ 9 files changed, 97 insertions(+), 35 deletions(-)
+ create mode 100644 database/migrations/2026_04_27_114325_add_holiday_to_attendance_status_enum.php
+
+diff --git a/app/Http/Controllers/Api/Mobile/AttendanceController.php b/app/Http/Controllers/Api/Mobile/AttendanceController.php
+index b6e7208..6e72f58 100644
+--- a/app/Http/Controllers/Api/Mobile/AttendanceController.php
++++ b/app/Http/Controllers/Api/Mobile/AttendanceController.php
+@@ -75,8 +75,9 @@ public function attendance(Request $request): JsonResponse
+             'leave'          => $records->where('status', 'leave')->count(),
+             'total'          => $records->count(),
+         ];
++        // Canonical formula: (present + late*0.5 + half_day*0.5) / total
+         $summary['attendance_pct'] = $summary['total'] > 0
+-            ? round(($summary['present'] + $summary['late'] * 0.5) / $summary['total'] * 100, 1)
++            ? round(($summary['present'] + $summary['late'] * 0.5 + $summary['half_day'] * 0.5) / $summary['total'] * 100, 1)
+             : 100;
+ 
+         return response()->json([
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index 31b5a53..c3696ea 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -523,8 +523,10 @@ public function attendance(Request $request): JsonResponse
+                 'leave'    => $records->where('status', 'leave')->count(),
+                 'total'    => $records->count(),
+             ];
++            // Canonical attendance % formula across the whole app:
++            // (present + late*0.5 + half_day*0.5) / total — late & half_day count as half credit.
+             $summary['attendance_pct'] = $summary['total'] > 0
+-                ? round(($summary['present'] + $summary['late'] * 0.5) / $summary['total'] * 100, 1)
++                ? round(($summary['present'] + $summary['late'] * 0.5 + $summary['half_day'] * 0.5) / $summary['total'] * 100, 1)
+                 : 0;
+ 
+             $dateFmt = $school->dateFmt();
+@@ -556,8 +558,9 @@ public function attendance(Request $request): JsonResponse
+             'leave'          => $records->where('status', 'leave')->count(),
+             'total'          => $records->count(),
+         ];
++        // Canonical formula: (present + late*0.5 + half_day*0.5) / total
+         $summary['attendance_pct'] = $summary['total'] > 0
+-            ? round(($summary['present'] + $summary['late'] * 0.5) / $summary['total'] * 100, 1)
++            ? round(($summary['present'] + $summary['late'] * 0.5 + $summary['half_day'] * 0.5) / $summary['total'] * 100, 1)
+             : 100;
+ 
+         $dateFmt = $school->dateFmt();
+@@ -1384,14 +1387,18 @@ private function stats($user, ?int $yearId, Request $request): array
+             $studentId = $this->resolveStudentId($user, $request);
+             if (!$studentId || !$yearId) return [];
+ 
+-            $totalAtt   = Attendance::where('student_id', $studentId)->where('academic_year_id', $yearId)->count();
+-            $presentAtt = Attendance::where('student_id', $studentId)->where('academic_year_id', $yearId)
+-                ->whereIn('status', ['present', 'late'])->count();
+-            $student    = Student::find($studentId);
+-            $feeSummary = $student ? $this->feeService->getStudentFeeSummary($student, $yearId, $school->id) : [];
++            // Canonical formula — (present + late*0.5 + half_day*0.5) / total
++            $totalAtt    = Attendance::where('student_id', $studentId)->where('academic_year_id', $yearId)->count();
++            $statusCount = Attendance::where('student_id', $studentId)->where('academic_year_id', $yearId)
++                ->selectRaw('status, COUNT(*) as c')->groupBy('status')->pluck('c', 'status')->toArray();
++            $weighted    = ($statusCount['present'] ?? 0)
++                         + ($statusCount['late']     ?? 0) * 0.5
++                         + ($statusCount['half_day'] ?? 0) * 0.5;
++            $student     = Student::find($studentId);
++            $feeSummary  = $student ? $this->feeService->getStudentFeeSummary($student, $yearId, $school->id) : [];
+ 
+             return [
+-                'attendance_pct'      => $totalAtt > 0 ? round($presentAtt / $totalAtt * 100) : 0,
++                'attendance_pct'      => $totalAtt > 0 ? round($weighted / $totalAtt * 100) : 0,
+                 'fee_balance'         => $feeSummary['balance']   ?? 0,
+                 'pending_assignments' => 0,
+                 'upcoming_exams'      => ExamSchedule::where('school_id', $school->id)
+@@ -1554,19 +1561,22 @@ private function attendanceSummary($user, ?int $yearId, Request $request): array
+             ->whereBetween('date', [now()->startOfMonth(), now()->endOfMonth()])
+             ->get();
+ 
+-        $present = $records->where('status', 'present')->count();
+-        $absent  = $records->where('status', 'absent')->count();
+-        $late    = $records->where('status', 'late')->count();
+-        $leave   = $records->where('status', 'leave')->count();
+-        $total   = $records->count();
++        $present  = $records->where('status', 'present')->count();
++        $absent   = $records->where('status', 'absent')->count();
++        $late     = $records->where('status', 'late')->count();
++        $halfDay  = $records->where('status', 'half_day')->count();
++        $leave    = $records->where('status', 'leave')->count();
++        $total    = $records->count();
+ 
+         return [
+             'present'        => $present,
+             'absent'         => $absent,
+             'late'           => $late,
++            'half_day'       => $halfDay,
+             'leave'          => $leave,
+             'total'          => $total,
+-            'attendance_pct' => $total > 0 ? round(($present + $late) / $total * 100) : 0,
++            // Canonical formula: (present + late*0.5 + half_day*0.5) / total
++            'attendance_pct' => $total > 0 ? round(($present + $late * 0.5 + $halfDay * 0.5) / $total * 100) : 0,
+             'today_status'   => $todayRecord?->status ?? 'not_marked',
+             'month'          => now()->format('M Y'),
+         ];
+@@ -3424,7 +3434,7 @@ public function markAttendance(Request $request): JsonResponse
+             'date'                    => 'required|date',
+             'attendance'              => 'required|array|min:1',
+             'attendance.*.student_id' => ['required', \Illuminate\Validation\Rule::exists('students', 'id')->where('school_id', $school->id)],
+-            'attendance.*.status'     => 'required|in:present,absent,late,half_day,leave',
++            'attendance.*.status'     => 'required|in:present,absent,late,half_day,leave,holiday',
+             'attendance.*.remarks'    => 'nullable|string|max:255',
+             'send_notifications'      => 'boolean',
+         ]);
+diff --git a/app/Http/Controllers/DashboardController.php b/app/Http/Controllers/DashboardController.php
+index e93924c..d0d26eb 100644
+--- a/app/Http/Controllers/DashboardController.php
++++ b/app/Http/Controllers/DashboardController.php
+@@ -240,9 +240,10 @@ public function index(Request $request)
+                     ->pluck('count', 'status')
+                     ->toArray();
+ 
+-                $presentToday = ($todayAttn['present'] ?? 0) + ($todayAttn['late'] ?? 0) + ($todayAttn['half_day'] ?? 0);
+-                $absentToday  = $todayAttn['absent'] ?? 0;
+-                $totalMarked  = array_sum($todayAttn);
++                $presentToday   = ($todayAttn['present'] ?? 0) + ($todayAttn['late'] ?? 0) + ($todayAttn['half_day'] ?? 0);
++                $absentToday    = $todayAttn['absent'] ?? 0;
++                $totalMarked    = array_sum($todayAttn);
++                $studentUnmarkedToday = max(0, $totalStudents - $totalMarked);
+ 
+                 // ── 6-Month Admission Trend ───────────────────────────────
+                 $admissionTrend = [];
+@@ -522,9 +523,10 @@ public function index(Request $request)
+                         'active_routes'      => $activeRoutes,
+                         'hostel_occupied'    => $hostelOccupied,
+                         'hostel_capacity'    => $hostelCapacity,
+-                        'present_today'      => $presentToday,
+-                        'absent_today'       => $absentToday,
+-                        'attendance_marked'  => $totalMarked,
++                        'present_today'         => $presentToday,
++                        'absent_today'          => $absentToday,
++                        'attendance_marked'     => $totalMarked,
++                        'student_unmarked_today'=> $studentUnmarkedToday,
+                     ],
+                     'admission_trend'      => $admissionTrend,
+                     'fee_trend'            => $feeTrend,
+diff --git a/app/Http/Controllers/School/AttendanceController.php b/app/Http/Controllers/School/AttendanceController.php
+index 30b66e3..031c587 100644
+--- a/app/Http/Controllers/School/AttendanceController.php
++++ b/app/Http/Controllers/School/AttendanceController.php
+@@ -112,7 +112,7 @@ public function store(Request $request)
+             'date'       => 'required|date',
+             'attendance' => 'required|array',
+             'attendance.*.student_id' => ['required', Rule::exists('students', 'id')->where('school_id', $schoolId)],
+-            'attendance.*.status'     => 'required|in:present,absent,late,half_day,leave',
++            'attendance.*.status'     => 'required|in:present,absent,late,half_day,leave,holiday',
+             'attendance.*.remarks'    => 'nullable|string|max:255',
+         ]);
+ 
+@@ -140,11 +140,19 @@ public function store(Request $request)
+             }
+         });
+ 
+-        // Trigger notifications only when explicitly requested via "Save & Send Notification" button
++        // Notifications now default to ON for non-Present statuses. The school
++        // admin can opt-out per request (send_notifications=false) or globally
++        // disable via settings.notifications_v2.attendance_auto_notify=false.
++        $school              = app('current_school');
++        $autoNotify          = $school->settings['notifications_v2']['attendance_auto_notify'] ?? true;
++        $shouldSendDefault   = $autoNotify;
++        $shouldSend          = $request->has('send_notifications')
++            ? $request->boolean('send_notifications')
++            : $shouldSendDefault;
++
+         $notificationsSent = 0;
+-        if ($request->boolean('send_notifications')) {
++        if ($shouldSend) {
+             try {
+-                $school = app('current_school');
+                 $notificationService = new NotificationService($school);
+                 $notifyAll = $school->settings['notifications_v2']['attendance_notify_all'] ?? false;
+ 
+diff --git a/app/Http/Controllers/School/Export/AttendanceExportController.php b/app/Http/Controllers/School/Export/AttendanceExportController.php
+index 386e4ce..9d09cd4 100644
+--- a/app/Http/Controllers/School/Export/AttendanceExportController.php
++++ b/app/Http/Controllers/School/Export/AttendanceExportController.php
+@@ -90,7 +90,9 @@ public function __invoke(Request $request)
+             }
+ 
+             $total = $present + $absent + $late + $leave;
+-            $pct   = $total > 0 ? round(($present + $late) / $total * 100) : 0;
++            // Canonical formula: (present + late*0.5 + half_day*0.5) / total
++            // Note: this exporter doesn't track half_day separately yet — late = half here.
++            $pct   = $total > 0 ? round(($present + $late * 0.5) / $total * 100) : 0;
+             $row   = array_merge($row, [$present, $absent, $late, $leave, $pct . '%']);
+             $rows[] = $row;
+         }
+diff --git a/app/Http/Controllers/School/StaffAttendanceController.php b/app/Http/Controllers/School/StaffAttendanceController.php
+index 55ab1c5..8d92cf2 100644
+--- a/app/Http/Controllers/School/StaffAttendanceController.php
++++ b/app/Http/Controllers/School/StaffAttendanceController.php
+@@ -184,10 +184,13 @@ public function report(Request $request)
+             $counts['working_days'] = $daysInMonth - $counts['holiday'];
+             $counts['unmarked'] = $daysInMonth - $staffRecords->count();
+ 
+-            // Build day-by-day map for calendar view
++            // Build day-by-day map for calendar view. Use the requested month's
++            // year/month — NOT the first record's date — otherwise staff with
++            // their only record on (say) 2026-04-28 would have the calendar
++            // built around that one record's year/month for every day.
+             $days = [];
+             for ($d = 1; $d <= $daysInMonth; $d++) {
+-                $dateStr = sprintf('%04d-%02d-%02d', $byDate->first()?->date->year ?? now()->year, $byDate->first()?->date->month ?? now()->month, $d);
++                $dateStr = sprintf('%04d-%02d-%02d', $startDate->year, $startDate->month, $d);
+                 $rec = $byDate->get($dateStr);
+                 $days[$d] = $rec ? $rec->status : null;
+             }
+diff --git a/database/migrations/2026_04_27_114325_add_holiday_to_attendance_status_enum.php b/database/migrations/2026_04_27_114325_add_holiday_to_attendance_status_enum.php
+new file mode 100644
+index 0000000..ee4dc0f
+--- /dev/null
++++ b/database/migrations/2026_04_27_114325_add_holiday_to_attendance_status_enum.php
+@@ -0,0 +1,27 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Support\Facades\DB;
++
++/**
++ * Aligns the student attendances.status enum with staff_attendances by adding
++ * 'holiday'. Without this, calling /mobile/attendance/mark with status='holiday'
++ * on a student row got a 422 — even though the staff equivalent accepted it,
++ * and the mobile UI showed 'Holiday' as a picker option.
++ */
++return new class extends Migration
++{
++    public function up(): void
++    {
++        DB::statement("ALTER TABLE attendances MODIFY status ENUM('present','absent','late','half_day','leave','holiday') NOT NULL");
++    }
++
++    public function down(): void
++    {
++        // Down is best-effort: any rows already set to 'holiday' would be dropped
++        // back to NULL/'present' by MySQL on a strict enum shrink. Convert them
++        // to 'leave' first so they're preserved as a non-Present status.
++        DB::statement("UPDATE attendances SET status = 'leave' WHERE status = 'holiday'");
++        DB::statement("ALTER TABLE attendances MODIFY status ENUM('present','absent','late','half_day','leave') NOT NULL");
++    }
++};
+diff --git a/resources/js/Pages/School/Dashboard.vue b/resources/js/Pages/School/Dashboard.vue
+index 222d167..d663dc8 100644
+--- a/resources/js/Pages/School/Dashboard.vue
++++ b/resources/js/Pages/School/Dashboard.vue
+@@ -467,8 +467,14 @@ const activeTab = ref('admissions')
+                     </svg>
+                 </div>
+                 <div class="bento-attend-row">
+-                    <span class="bento-attend-item bento-attend-item--green">{{ fmt(kpi.present_today) }} in</span>
+-                    <span class="bento-attend-item bento-attend-item--red">{{ fmt(kpi.absent_today) }} out</span>
++                    <template v-if="(kpi.attendance_marked ?? 0) === 0">
++                        <span class="bento-attend-item" style="color:#b45309">Not marked yet</span>
++                    </template>
++                    <template v-else>
++                        <span class="bento-attend-item bento-attend-item--green">{{ fmt(kpi.present_today) }} in</span>
++                        <span class="bento-attend-item bento-attend-item--red">{{ fmt(kpi.absent_today) }} out</span>
++                        <span v-if="(kpi.student_unmarked_today ?? 0) > 0" class="bento-attend-item" style="color:#b45309">{{ fmt(kpi.student_unmarked_today) }} unmarked</span>
++                    </template>
+                 </div>
+             </div>
+ 
+diff --git a/routes/web.php b/routes/web.php
+index 04c2063..ffef6a3 100644
+--- a/routes/web.php
++++ b/routes/web.php
+@@ -500,11 +500,14 @@
+             Route::patch('leave-types/{leaveType}/toggle',    [$LTC, 'toggle'])  ->name('leave-types.toggle');
+             Route::post('leave-types/reorder',                [$LTC, 'reorder']) ->name('leave-types.reorder');
+ 
+-            // Staff Attendance
++            // Staff Attendance — admin / principal / school_admin only.
++            // Regular teachers must not be able to mark or view all staff attendance.
+             $SAC = \App\Http\Controllers\School\StaffAttendanceController::class;
+-            Route::get('staff-attendance',         [$SAC, 'index'])  ->name('staff-attendance.index');
+-            Route::post('staff-attendance',        [$SAC, 'store'])  ->name('staff-attendance.store');
+-            Route::get('staff-attendance/report',  [$SAC, 'report']) ->name('staff-attendance.report');
++            Route::middleware('school.management:admin_only')->group(function () use ($SAC) {
++                Route::get('staff-attendance',         [$SAC, 'index'])  ->name('staff-attendance.index');
++                Route::post('staff-attendance',        [$SAC, 'store'])  ->name('staff-attendance.store');
++                Route::get('staff-attendance/report',  [$SAC, 'report']) ->name('staff-attendance.report');
++            });
+         });
+ 
+         Route::middleware(['school.management', 'module:payroll'])->group(function () {
+-- 
+2.52.0.windows.1
+

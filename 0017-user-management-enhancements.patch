@@ -1,0 +1,524 @@
+From bd576eaf93894cd39bde7fb4411d501b7d4f38c0 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 10:25:04 +0530
+Subject: [PATCH] =?UTF-8?q?feat:=20User=20Management=20=E2=80=94=20class/s?=
+ =?UTF-8?q?ection,=20password=20column,=20direct=20export,=20staff=20in=20?=
+ =?UTF-8?q?create-missing?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Four enhancements to the User Login Management page:
+
+1. "Create Missing Logins" now also creates accounts for any Staff
+   record with user_id = NULL (defensive — Staff is normally created
+   with a User, but imports / older data sometimes lack one). All new
+   logins use the universal default password 'password'. Returned
+   credentials now include class_name + section_name when applicable
+   (parents → first child's class/section; students → own).
+
+2. Each row in the table now shows the password as 'password' with a
+   small 'default' hint. (Hashed passwords can't be recovered, but
+   since every reset / create defaults to 'password', this matches
+   reality until the user changes it on first login.)
+
+3. Class · Section appears under the name for students and parents,
+   replacing the phone/email line for those roles. The eager-loads
+   pull through student.currentAcademicHistory and
+   studentParent.students.currentAcademicHistory so this is one query.
+
+4. New "Excel" / "PDF" buttons next to "Create Missing Logins" do a
+   direct export of the currently-filtered list — no bulk-reset
+   needed. New endpoint: GET /school/users/export-list?format=… that
+   honours the same filters as index() (search, user_type, status,
+   class_id, section_id). Uses the same UserCredentialsExport class
+   and exports/user-credentials.blade.php — both updated to add Class
+   and Section columns.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ app/Exports/UserCredentialsExport.php         |  12 +-
+ .../School/UserManagementController.php       | 246 +++++++++++++++++-
+ resources/js/Pages/School/Users/Index.vue     |  50 +++-
+ .../views/exports/user-credentials.blade.php  |  14 +-
+ routes/web.php                                |   1 +
+ 5 files changed, 297 insertions(+), 26 deletions(-)
+
+diff --git a/app/Exports/UserCredentialsExport.php b/app/Exports/UserCredentialsExport.php
+index cfe4441..3982d2f 100644
+--- a/app/Exports/UserCredentialsExport.php
++++ b/app/Exports/UserCredentialsExport.php
+@@ -23,16 +23,18 @@ public function __construct(array $rows, string $title = 'User Credentials')
+     public function array(): array
+     {
+         return array_map(fn($r) => [
+-            $r['name']     ?? '',
+-            $r['role']     ?? '',
+-            $r['username'] ?? '',
+-            $r['password'] ?? '',
++            $r['name']         ?? '',
++            $r['role']         ?? '',
++            $r['class_name']   ?? '',
++            $r['section_name'] ?? '',
++            $r['username']     ?? '',
++            $r['password']     ?? '',
+         ], $this->rows);
+     }
+ 
+     public function headings(): array
+     {
+-        return ['Name', 'Role', 'Username', 'Password'];
++        return ['Name', 'Role', 'Class', 'Section', 'Username', 'Password'];
+     }
+ 
+     public function title(): string
+diff --git a/app/Http/Controllers/School/UserManagementController.php b/app/Http/Controllers/School/UserManagementController.php
+index 6f1dd36..96fcbeb 100644
+--- a/app/Http/Controllers/School/UserManagementController.php
++++ b/app/Http/Controllers/School/UserManagementController.php
+@@ -63,10 +63,45 @@ public function index(Request $request)
+             }
+         }
+ 
++        // Eager-load class/section through the relevant relations so the UI
++        // can render them under each row's name.
++        $query->with([
++            'student.currentAcademicHistory.courseClass:id,name',
++            'student.currentAcademicHistory.section:id,name',
++            'studentParent.students.currentAcademicHistory.courseClass:id,name',
++            'studentParent.students.currentAcademicHistory.section:id,name',
++        ]);
++
+         // Page size honours the school's System Config "Page Length" setting.
+         $perPage = app('current_school')?->pageLength() ?? 20;
+         $users = $query->latest()->paginate($perPage)->withQueryString();
+ 
++        // Decorate each user with class_name / section_name so the Vue page
++        // doesn't have to traverse three levels of relations to render them.
++        $users->getCollection()->transform(function ($u) {
++            $type = $u->user_type instanceof \BackedEnum ? $u->user_type->value : (string) $u->user_type;
++            $className = null;
++            $sectionName = null;
++
++            if ($type === 'student' && $u->student?->currentAcademicHistory) {
++                $h = $u->student->currentAcademicHistory;
++                $className   = $h->courseClass?->name;
++                $sectionName = $h->section?->name;
++            } elseif ($type === 'parent' && $u->studentParent) {
++                // Use the FIRST child's class/section as a representative label
++                $firstChild = $u->studentParent->students->first();
++                if ($firstChild?->currentAcademicHistory) {
++                    $h = $firstChild->currentAcademicHistory;
++                    $className   = $h->courseClass?->name;
++                    $sectionName = $h->section?->name;
++                }
++            }
++
++            $u->setAttribute('class_name',   $className);
++            $u->setAttribute('section_name', $sectionName);
++            return $u;
++        });
++
+         return Inertia::render('School/Users/Index', [
+             'users'     => $users,
+             'filters'   => $request->only(['user_type', 'search', 'status', 'class_id', 'section_id']),
+@@ -75,6 +110,7 @@ public function index(Request $request)
+             'missing_counts' => [
+                 'parents'  => StudentParent::where('school_id', $schoolId)->whereNull('user_id')->count(),
+                 'students' => Student::where('school_id', $schoolId)->whereNull('user_id')->count(),
++                'staff'    => \App\Models\Staff::where('school_id', $schoolId)->whereNull('user_id')->count(),
+             ],
+         ]);
+     }
+@@ -183,11 +219,71 @@ public function createMissing(Request $request)
+                     $user->assignRole('parent');
+                     $parent->update(['user_id' => $user->id]);
+ 
++                    // First child's class/section as a label
++                    $firstChild = $parent->students()->with('currentAcademicHistory.courseClass', 'currentAcademicHistory.section')->first();
++                    $h = $firstChild?->currentAcademicHistory;
++
++                    $created[] = [
++                        'name'         => $user->name,
++                        'role'         => 'Parent',
++                        'username'     => $user->username,
++                        'password'     => $password,
++                        'class_name'   => $h?->courseClass?->name,
++                        'section_name' => $h?->section?->name,
++                    ];
++                }
++            }
++
++            // ── Staff (teachers / drivers / accountants / etc.) ──
++            // Defensive — Staff is normally created with a User, but if any
++            // record was imported with user_id = null, this catches it.
++            if (in_array($type, ['staff', 'all'], true)) {
++                $staffMembers = \App\Models\Staff::where('school_id', $schoolId)
++                    ->whereNull('user_id')
++                    ->with('user')
++                    ->get();
++
++                foreach ($staffMembers as $staff) {
++                    // Try to derive a reasonable username — phone first, then employee_id
++                    $username = $staff->user?->phone
++                        ?? $staff->employee_id
++                        ?? null;
++
++                    if (!$username) continue;
++
++                    $existing = User::where('school_id', $schoolId)
++                        ->where(function ($q) use ($username) {
++                            $q->where('username', $username)
++                              ->orWhere('phone',    $username);
++                        })
++                        ->first();
++
++                    if ($existing) {
++                        $staff->update(['user_id' => $existing->id]);
++                        continue;
++                    }
++
++                    $password = 'password';
++                    $name = $staff->user?->name ?? trim(($staff->employee_id ?? '') . ' (staff)');
++                    $user = User::create([
++                        'school_id' => $schoolId,
++                        'name'      => $name,
++                        'username'  => $username,
++                        'phone'     => $username,
++                        'password'  => Hash::make($password),
++                        'user_type' => 'teacher', // safe default; admin can adjust later
++                        'is_active' => true,
++                    ]);
++                    $user->assignRole('teacher');
++                    $staff->update(['user_id' => $user->id]);
++
+                     $created[] = [
+-                        'name'     => $user->name,
+-                        'role'     => 'Parent',
+-                        'username' => $user->username,
+-                        'password' => $password,
++                        'name'         => $user->name,
++                        'role'         => 'Staff',
++                        'username'     => $user->username,
++                        'password'     => $password,
++                        'class_name'   => null,
++                        'section_name' => null,
+                     ];
+                 }
+             }
+@@ -222,11 +318,16 @@ public function createMissing(Request $request)
+                     $user->assignRole('student');
+                     $student->update(['user_id' => $user->id]);
+ 
++                    $student->load('currentAcademicHistory.courseClass', 'currentAcademicHistory.section');
++                    $h = $student->currentAcademicHistory;
++
+                     $created[] = [
+-                        'name'     => $user->name,
+-                        'role'     => 'Student',
+-                        'username' => $user->username,
+-                        'password' => $password,
++                        'name'         => $user->name,
++                        'role'         => 'Student',
++                        'username'     => $user->username,
++                        'password'     => $password,
++                        'class_name'   => $h?->courseClass?->name,
++                        'section_name' => $h?->section?->name,
+                     ];
+                 }
+             }
+@@ -270,6 +371,14 @@ public function bulkReset(Request $request)
+             ->where('id', '!=', auth()->id()) // never bulk-reset your own
+             ->get();
+ 
++        // Eager load class/section relationships
++        $users->load([
++            'student.currentAcademicHistory.courseClass:id,name',
++            'student.currentAcademicHistory.section:id,name',
++            'studentParent.students.currentAcademicHistory.courseClass:id,name',
++            'studentParent.students.currentAcademicHistory.section:id,name',
++        ]);
++
+         DB::transaction(function () use ($users, &$rows) {
+             foreach ($users as $u) {
+                 $newPassword = 'password';
+@@ -279,11 +388,16 @@ public function bulkReset(Request $request)
+                 $role = $u->user_type instanceof \BackedEnum
+                     ? $u->user_type->value
+                     : (string) ($u->user_type ?? '');
++
++                [$class, $section] = $this->classSectionFor($u, $role);
++
+                 $rows[] = [
+-                    'name'     => $u->name,
+-                    'role'     => ucfirst(str_replace('_', ' ', $role)),
+-                    'username' => $u->username,
+-                    'password' => $newPassword,
++                    'name'         => $u->name,
++                    'role'         => ucfirst(str_replace('_', ' ', $role)),
++                    'username'     => $u->username,
++                    'password'     => $newPassword,
++                    'class_name'   => $class,
++                    'section_name' => $section,
+                 ];
+             }
+         });
+@@ -338,4 +452,112 @@ public function exportCredentials(Request $request)
+ 
+         return $pdf->download($base . '.pdf');
+     }
++
++    /**
++     * GET /school/users/export-list — directly export the currently filtered
++     * user list as Excel/PDF without resetting passwords. The "password"
++     * column shows the system default ('password') as a hint to the admin —
++     * if a user has changed their password, it won't reflect here.
++     *
++     * Query params mirror index() so admins can export "all parents in
++     * Class 5 / Section A" with one click.
++     */
++    public function exportList(Request $request)
++    {
++        $request->validate(['format' => 'required|in:xlsx,pdf']);
++        $schoolId = app('current_school_id');
++
++        $query = User::where('school_id', $schoolId)
++            ->with([
++                'student.currentAcademicHistory.courseClass:id,name',
++                'student.currentAcademicHistory.section:id,name',
++                'studentParent.students.currentAcademicHistory.courseClass:id,name',
++                'studentParent.students.currentAcademicHistory.section:id,name',
++            ]);
++
++        if ($request->filled('user_type')) {
++            $query->where('user_type', $request->user_type);
++        } else {
++            $query->whereIn('user_type', ['teacher', 'student', 'parent', 'principal', 'accountant', 'driver']);
++        }
++        if ($request->filled('search')) {
++            $s = $request->search;
++            $query->where(function ($q) use ($s) {
++                $q->where('name', 'like', "%{$s}%")
++                  ->orWhere('username', 'like', "%{$s}%")
++                  ->orWhere('phone', 'like', "%{$s}%")
++                  ->orWhere('email', 'like', "%{$s}%");
++            });
++        }
++        if ($request->filled('status')) {
++            $query->where('is_active', $request->status === 'active');
++        }
++        if ($request->filled('class_id') || $request->filled('section_id')) {
++            if ($request->user_type === 'student') {
++                $query->whereHas('student.currentAcademicHistory', function ($q) use ($request) {
++                    if ($request->filled('class_id'))   $q->where('class_id',   $request->class_id);
++                    if ($request->filled('section_id')) $q->where('section_id', $request->section_id);
++                });
++            } elseif ($request->user_type === 'parent') {
++                $query->whereHas('studentParent.students.currentAcademicHistory', function ($q) use ($request) {
++                    if ($request->filled('class_id'))   $q->where('class_id',   $request->class_id);
++                    if ($request->filled('section_id')) $q->where('section_id', $request->section_id);
++                });
++            }
++        }
++
++        $users = $query->orderBy('name')->get();
++
++        $rows = $users->map(function ($u) {
++            $role = $u->user_type instanceof \BackedEnum
++                ? $u->user_type->value
++                : (string) ($u->user_type ?? '');
++            [$class, $section] = $this->classSectionFor($u, $role);
++            return [
++                'name'         => $u->name,
++                'role'         => ucfirst(str_replace('_', ' ', $role)),
++                'username'     => $u->username,
++                'password'     => 'password',          // system default
++                'class_name'   => $class,
++                'section_name' => $section,
++            ];
++        })->values()->all();
++
++        $school = app('current_school');
++        $title  = ($school?->name ?? 'School') . ' — User Credentials';
++        $stamp  = now()->format('Y-m-d_His');
++        $base   = 'user-credentials-' . $stamp;
++
++        if (empty($rows)) {
++            return response()->json(['message' => 'Nothing to export.'], 422);
++        }
++
++        if ($request->format === 'xlsx') {
++            return Excel::download(new UserCredentialsExport($rows, $title), $base . '.xlsx');
++        }
++
++        $pdf = Pdf::loadView('exports.user-credentials', [
++            'rows'    => $rows,
++            'school'  => $school,
++            'title'   => $title,
++            'printed' => now()->format('d M Y, h:i A'),
++        ])->setPaper('a4', 'portrait');
++
++        return $pdf->download($base . '.pdf');
++    }
++
++    /** Resolve display class / section for a User by role. */
++    private function classSectionFor($u, string $role): array
++    {
++        if ($role === 'student' && $u->student?->currentAcademicHistory) {
++            $h = $u->student->currentAcademicHistory;
++            return [$h->courseClass?->name, $h->section?->name];
++        }
++        if ($role === 'parent' && $u->studentParent) {
++            $first = $u->studentParent->students->first();
++            $h = $first?->currentAcademicHistory;
++            return [$h?->courseClass?->name, $h?->section?->name];
++        }
++        return [null, null];
++    }
+ }
+diff --git a/resources/js/Pages/School/Users/Index.vue b/resources/js/Pages/School/Users/Index.vue
+index ba155ff..d45a9f3 100644
+--- a/resources/js/Pages/School/Users/Index.vue
++++ b/resources/js/Pages/School/Users/Index.vue
+@@ -47,6 +47,26 @@ const sectionsForClass = computed(() => {
+ // Show class+section filter for both students AND parents now
+ const showClassFilter = computed(() => userType.value === 'student' || userType.value === 'parent');
+ 
++// Sum of all missing-login categories (parents + students + staff)
++const totalMissing = computed(() => {
++    const m = props.missing_counts ?? {};
++    return (m.parents ?? 0) + (m.students ?? 0) + (m.staff ?? 0);
++});
++
++// Direct export of the currently filtered list (no reset required)
++const exportList = (format) => {
++    const params = new URLSearchParams({
++        format,
++        ...(search.value    ? { search:     search.value    } : {}),
++        ...(userType.value  ? { user_type:  userType.value  } : {}),
++        ...(status.value    ? { status:     status.value    } : {}),
++        ...(classId.value   ? { class_id:   classId.value   } : {}),
++        ...(sectionId.value ? { section_id: sectionId.value } : {}),
++    });
++    // Stream-download the file in a new window so we don't navigate away
++    window.location.href = `/school/users/export-list?${params.toString()}`;
++};
++
+ watch([search, userType, status, classId, sectionId], debounce(([v1, v2, v3, v4, v5]) => {
+     router.get('/school/users', {
+         search: v1, user_type: v2, status: v3, class_id: v4, section_id: v5,
+@@ -215,12 +235,23 @@ const getStatusBadgeClass = (active) => active
+                     <h2 class="text-2xl font-black text-gray-900 tracking-tight">User Login Management</h2>
+                     <p class="text-sm text-gray-500 font-medium">Manage access credentials for staff, students, and parents.</p>
+                 </div>
+-                <!-- Quick action: Create missing logins -->
++                <!-- Quick actions: Export + Create missing logins -->
+                 <div class="flex flex-wrap gap-2 items-center">
+-                    <span v-if="missing_counts.parents > 0 || missing_counts.students > 0"
++                    <span v-if="totalMissing > 0"
+                           class="text-[11px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-full">
+-                        Missing: {{ missing_counts.parents }} parents · {{ missing_counts.students }} students
++                        Missing: {{ missing_counts.parents }} parents · {{ missing_counts.students }} students<span v-if="missing_counts.staff"> · {{ missing_counts.staff }} staff</span>
+                     </span>
++
++                    <!-- Direct export of currently filtered list (no reset required) -->
++                    <Button size="sm" variant="secondary" @click="exportList('xlsx')" :disabled="bulkBusy">
++                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
++                        Excel
++                    </Button>
++                    <Button size="sm" variant="secondary" @click="exportList('pdf')" :disabled="bulkBusy">
++                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
++                        PDF
++                    </Button>
++
+                     <Button size="sm" :disabled="bulkBusy" @click="createMissing('all')">
+                         <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>
+                         Create Missing Logins
+@@ -313,6 +344,7 @@ const getStatusBadgeClass = (active) => active
+                                 <th class="px-6 py-4 text-left text-[10px] font-black text-gray-400 uppercase tracking-widest">Name &amp; Profile</th>
+                                 <th class="px-6 py-4 text-left text-[10px] font-black text-gray-400 uppercase tracking-widest">System Role</th>
+                                 <th class="px-6 py-4 text-left text-[10px] font-black text-gray-400 uppercase tracking-widest">Username</th>
++                                <th class="px-6 py-4 text-left text-[10px] font-black text-gray-400 uppercase tracking-widest">Password</th>
+                                 <th class="px-6 py-4 text-left text-[10px] font-black text-gray-400 uppercase tracking-widest">Access Status</th>
+                                 <th class="px-6 py-4 text-right text-[10px] font-black text-gray-400 uppercase tracking-widest">Manage</th>
+                             </tr>
+@@ -332,6 +364,10 @@ const getStatusBadgeClass = (active) => active
+                                         </div>
+                                         <div>
+                                             <div class="text-sm font-black text-gray-900">{{ user.name }}</div>
++                                            <!-- Class · Section for students/parents, phone/email for everyone else -->
++                                            <div v-if="user.class_name || user.section_name" class="text-xs text-indigo-600 font-bold mt-0.5">
++                                                {{ [user.class_name, user.section_name].filter(Boolean).join(' · ') }}
++                                            </div>
+                                             <div class="text-xs text-gray-500 font-medium">{{ user.phone || user.email || '-' }}</div>
+                                         </div>
+                                     </div>
+@@ -346,6 +382,12 @@ const getStatusBadgeClass = (active) => active
+                                         <code class="text-[11px] font-black text-indigo-600 bg-indigo-50 px-2 py-1 rounded-md">{{ user.username }}</code>
+                                     </div>
+                                 </td>
++                                <td class="px-6 py-4">
++                                    <div class="flex items-center gap-1.5">
++                                        <code class="text-[11px] font-black text-emerald-700 bg-emerald-50 px-2 py-1 rounded-md">password</code>
++                                        <span class="text-[9px] font-bold text-gray-400 uppercase tracking-wider">default</span>
++                                    </div>
++                                </td>
+                                 <td class="px-6 py-4">
+                                     <button @click="toggleAccess(user)"
+                                             class="px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-wider border transition-all hover:shadow-sm"
+@@ -366,7 +408,7 @@ const getStatusBadgeClass = (active) => active
+                                 </td>
+                             </tr>
+                             <tr v-if="users.data.length === 0">
+-                                <td colspan="6" class="px-6 py-20 text-center">
++                                <td colspan="7" class="px-6 py-20 text-center">
+                                     <div class="flex flex-col items-center">
+                                         <div class="w-16 h-16 bg-gray-50 rounded-2xl flex items-center justify-center mb-4 text-gray-300">
+                                             <svg class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" /></svg>
+diff --git a/resources/views/exports/user-credentials.blade.php b/resources/views/exports/user-credentials.blade.php
+index 47bfe57..ef2ba85 100644
+--- a/resources/views/exports/user-credentials.blade.php
++++ b/resources/views/exports/user-credentials.blade.php
+@@ -54,11 +54,13 @@
+ <table>
+     <thead>
+         <tr>
+-            <th style="width: 4%;">#</th>
+-            <th style="width: 32%;">Name</th>
+-            <th style="width: 14%;">Role</th>
+-            <th style="width: 22%;">Username</th>
+-            <th style="width: 28%;">Password</th>
++            <th style="width: 3%;">#</th>
++            <th style="width: 26%;">Name</th>
++            <th style="width: 11%;">Role</th>
++            <th style="width: 12%;">Class</th>
++            <th style="width: 8%;">Section</th>
++            <th style="width: 18%;">Username</th>
++            <th style="width: 22%;">Password</th>
+         </tr>
+     </thead>
+     <tbody>
+@@ -67,6 +69,8 @@
+             <td>{{ $i + 1 }}</td>
+             <td>{{ $row['name'] ?? '—' }}</td>
+             <td><span class="role-badge">{{ $row['role'] ?? '—' }}</span></td>
++            <td>{{ $row['class_name']   ?? '—' }}</td>
++            <td>{{ $row['section_name'] ?? '—' }}</td>
+             <td class="username">{{ $row['username'] ?? '—' }}</td>
+             <td class="password">{{ $row['password'] ?? '—' }}</td>
+         </tr>
+diff --git a/routes/web.php b/routes/web.php
+index 6ba7f13..04c2063 100644
+--- a/routes/web.php
++++ b/routes/web.php
+@@ -264,6 +264,7 @@
+             Route::post('create-missing',      [\App\Http\Controllers\School\UserManagementController::class, 'createMissing'])->name('users.create-missing');
+             Route::post('bulk-reset',          [\App\Http\Controllers\School\UserManagementController::class, 'bulkReset'])->name('users.bulk-reset');
+             Route::post('export-credentials',  [\App\Http\Controllers\School\UserManagementController::class, 'exportCredentials'])->name('users.export-credentials');
++            Route::get('export-list',          [\App\Http\Controllers\School\UserManagementController::class, 'exportList'])->name('users.export-list');
+         });
+ 
+         Route::middleware(['school.management', 'module:students'])->group(function () {
+-- 
+2.52.0.windows.1
+

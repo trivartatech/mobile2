@@ -1,0 +1,44 @@
+From 6be6860cb7613fee69bf679a1be6d9de8b961e48 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 18:53:12 +0530
+Subject: [PATCH] fix: driver dropdown empty on Edit Vehicle modal
+
+The dropdown filter required a staff designation row with name='driver'
+to populate the list. Most installations identify drivers via
+users.user_type='driver' instead and never set up the designation, so
+the dropdown was empty even when a real driver user existed.
+
+Now matches staff whose linked user has user_type='driver' OR (legacy
+fallback) whose designation name equals 'driver'. Both patterns work,
+no migration needed.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/School/Transport/VehicleController.php | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/app/Http/Controllers/School/Transport/VehicleController.php b/app/Http/Controllers/School/Transport/VehicleController.php
+index 945c807..e14bb5f 100644
+--- a/app/Http/Controllers/School/Transport/VehicleController.php
++++ b/app/Http/Controllers/School/Transport/VehicleController.php
+@@ -28,9 +28,15 @@ public function index()
+ 
+         $routes = TransportRoute::tenant()->active()->orderBy('route_name')->get(['id', 'route_name', 'route_code']);
+ 
+-        // Only staff with Driver designation
++        // Drivers are identified by users.user_type = 'driver'. Falling back to
++        // the legacy designation match catches any older deployments where the
++        // user_type wasn't set but a "Driver" designation was — that way both
++        // patterns work.
+         $drivers = Staff::tenant()
+-            ->whereHas('designation', fn($q) => $q->whereRaw('LOWER(name) = ?', ['driver']))
++            ->where(function ($q) {
++                $q->whereHas('user', fn($u) => $u->where('user_type', 'driver'))
++                  ->orWhereHas('designation', fn($d) => $d->whereRaw('LOWER(name) = ?', ['driver']));
++            })
+             ->with('user:id,name,phone')
+             ->get(['id', 'user_id']);
+ 
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,108 @@
+From 2baa34324fa1a59f37f642925fbc5a6ccd63c19b Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 19:00:31 +0530
+Subject: [PATCH] fix: driver dashboard 'no vehicles' even when vehicle is
+ assigned
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two stacked bugs caused drivers to see 'no vehicles assigned' on the
+mobile dashboard immediately after admin assigned them a vehicle:
+
+1. /mobile/transport/live only returns vehicles with a live_location
+   row updated in the last 5 minutes. Drivers who hadn't started GPS
+   tracking yet got an empty array — but the dashboard pulled this
+   endpoint to find the driver's bus.
+
+2. The mobile DashboardScreen was reading data?.vehicles, but the
+   /transport/live endpoint returns {locations, my_allocation}. So
+   even with a fresh GPS update the dashboard would see nothing.
+
+Fix on the backend half: assignedVehicles() now returns the full
+route + stops + student counts (and live status) so the driver
+dashboard can show the bus / route / total-students info regardless
+of whether GPS tracking is running. Mobile half (separate commit)
+switches DashboardScreen and StudentsScreen to this endpoint.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Transport/DriverTrackingController.php    | 53 ++++++++++++++-----
+ 1 file changed, 41 insertions(+), 12 deletions(-)
+
+diff --git a/app/Http/Controllers/Api/Transport/DriverTrackingController.php b/app/Http/Controllers/Api/Transport/DriverTrackingController.php
+index d8e1360..73d6b18 100644
+--- a/app/Http/Controllers/Api/Transport/DriverTrackingController.php
++++ b/app/Http/Controllers/Api/Transport/DriverTrackingController.php
+@@ -13,9 +13,12 @@ class DriverTrackingController extends Controller
+ {
+     /**
+      * Assigned vehicles for the logged-in driver/conductor.
+-     * Used by the mobile Route screen to populate the vehicle picker.
+-     * Returns a flat shape the mobile UI expects: id, vehicle_number,
+-     * route_name, capacity.
++     * Used by the mobile Route screen (vehicle picker), Dashboard, and
++     * Students screen — so the response includes the route + stops with
++     * student counts even when GPS isn't running. The Dashboard previously
++     * relied on /mobile/transport/live, which only returns vehicles with
++     * a recent live_location row — so a freshly-assigned driver who hadn't
++     * started tracking yet always saw "no vehicles assigned".
+      */
+     public function assignedVehicles(Request $request): JsonResponse
+     {
+@@ -36,17 +39,43 @@ public function assignedVehicles(Request $request): JsonResponse
+                 $q->where('driver_id', $staffId)
+                   ->orWhere('conductor_id', $staffId);
+             })
+-            ->with(['route:id,route_name,route_code'])
++            ->with([
++                'route:id,route_name,route_code,start_location,end_location',
++                'route.stops' => fn($q) => $q->orderBy('stop_order'),
++                'route.stops.studentAllocations' => fn($q) => $q->where('status', 'active'),
++                'liveLocation',
++            ])
+             ->orderBy('vehicle_number')
+             ->get()
+-            ->map(fn ($v) => [
+-                'id'             => $v->id,
+-                'vehicle_number' => $v->vehicle_number,
+-                'vehicle_name'   => $v->vehicle_name,
+-                'route_name'     => $v->route?->route_name,
+-                'route_code'     => $v->route?->route_code,
+-                'capacity'       => $v->capacity,
+-            ])
++            ->map(function ($v) {
++                $stops = ($v->route?->stops ?? collect())->map(fn ($s) => [
++                    'id'            => $s->id,
++                    'name'          => $s->stop_name,
++                    'stop_order'    => $s->stop_order,
++                    'pickup_time'   => $s->pickup_time,
++                    'drop_time'     => $s->drop_time,
++                    'student_count' => $s->studentAllocations->count(),
++                    // status is inferred client-side once GPS is live; default upcoming
++                    'status'        => 'upcoming',
++                ])->values();
++
++                $live   = $v->liveLocation;
++                $isLive = $live && $live->updated_at >= now()->subMinutes(5);
++
++                return [
++                    'id'             => $v->id,
++                    'vehicle_number' => $v->vehicle_number,
++                    'vehicle_name'   => $v->vehicle_name,
++                    'route_id'       => $v->route_id,
++                    'route_name'     => $v->route?->route_name,
++                    'route_code'     => $v->route?->route_code,
++                    'capacity'       => $v->capacity,
++                    'status'         => $v->status,
++                    'is_live'        => $isLive,
++                    'stops'          => $stops,
++                    'total_students' => $stops->sum('student_count'),
++                ];
++            })
+             ->values();
+ 
+         // Returned twice under different keys for mobile-client compatibility:
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,61 @@
+From dd8323227adb18ca4a20c3c5922f3c3dba32e782 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 18:03:02 +0530
+Subject: [PATCH] =?UTF-8?q?fix:=20mobile=20students=20list=20=E2=80=94=20s?=
+ =?UTF-8?q?cope=20to=20current=20academic=20year=20only?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The /mobile/students endpoint was returning duplicate rows — one per
+academic history entry — so a student with 4 years of history appeared
+4 times in search results.
+
+Switched the student_academic_histories join from LEFT to INNER and
+filtered by current_academic_year_id. Students who aren't enrolled this
+year (graduated / transferred) drop out of the list, which is what the
+admin "Students" screen actually wants.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ app/Http/Controllers/Api/MobileApiController.php | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index 73f6d9f..309a867 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -79,19 +79,29 @@ public function studentList(Request $request): JsonResponse
+     {
+         $user    = $request->user();
+         $school  = app('current_school');
++        $yearId  = app()->bound('current_academic_year_id') ? app('current_academic_year_id') : null;
+         $search  = $request->input('search', '');
+         $classId = $request->input('class_id');
+         $secId   = $request->input('section_id');
+         $gender  = $request->input('gender');
+         $perPage = 20;
+ 
++        // Inner-join to student_academic_histories for the CURRENT year only.
++        // Without the year filter the join returned one row per academic
++        // history record, so a student enrolled for 4 years showed up 4 times
++        // in search results. The inner join also drops students who aren't
++        // enrolled this year (graduated / transferred out), which is what the
++        // admin "Students" screen actually wants.
+         $query = Student::where('students.school_id', $school->id)
+             ->select('students.id', 'students.first_name', 'students.last_name',
+                 'students.admission_no', 'students.roll_no', 'students.gender',
+                 'students.status', 'students.photo',
+                 'cc.name as class_name', 'sec.name as section_name',
+                 'sah.class_id', 'sah.section_id', 'u.phone')
+-            ->leftJoin('student_academic_histories as sah', 'sah.student_id', '=', 'students.id')
++            ->join('student_academic_histories as sah', function ($j) use ($yearId) {
++                $j->on('sah.student_id', '=', 'students.id');
++                if ($yearId) $j->where('sah.academic_year_id', '=', $yearId);
++            })
+             ->leftJoin('course_classes as cc', 'cc.id', '=', 'sah.class_id')
+             ->leftJoin('sections as sec', 'sec.id', '=', 'sah.section_id')
+             ->leftJoin('users as u', 'u.id', '=', 'students.user_id');
+-- 
+2.52.0.windows.1
+

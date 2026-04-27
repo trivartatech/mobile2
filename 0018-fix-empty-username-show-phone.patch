@@ -1,0 +1,64 @@
+From 31c4f3e21a33d91998cd755293d1a7618646d5b8 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 10:30:04 +0530
+Subject: [PATCH] fix: show phone when staff username is empty
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Staff users created via the web Staff form sometimes have an empty
+username — they log in with their phone number, which the AuthController
+already accepts as a fallback ('username' OR 'phone' OR 'email').
+
+The User Management table was showing an empty 'code' chip in those
+cases, which looked like a bug. Now the column falls back to phone,
+then email, then '—'. Same fallback applied to the bulk-reset rows
+and the direct export, so exported credentials always carry a usable
+login identifier.
+
+No data backfill needed — login works either way.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ app/Http/Controllers/School/UserManagementController.php | 4 ++--
+ resources/js/Pages/School/Users/Index.vue                | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/app/Http/Controllers/School/UserManagementController.php b/app/Http/Controllers/School/UserManagementController.php
+index 96fcbeb..6b62c09 100644
+--- a/app/Http/Controllers/School/UserManagementController.php
++++ b/app/Http/Controllers/School/UserManagementController.php
+@@ -394,7 +394,7 @@ public function bulkReset(Request $request)
+                 $rows[] = [
+                     'name'         => $u->name,
+                     'role'         => ucfirst(str_replace('_', ' ', $role)),
+-                    'username'     => $u->username,
++                    'username'     => $u->username ?: $u->phone ?: $u->email ?: '—',
+                     'password'     => $newPassword,
+                     'class_name'   => $class,
+                     'section_name' => $section,
+@@ -516,7 +516,7 @@ public function exportList(Request $request)
+             return [
+                 'name'         => $u->name,
+                 'role'         => ucfirst(str_replace('_', ' ', $role)),
+-                'username'     => $u->username,
++                'username'     => $u->username ?: $u->phone ?: $u->email ?: '—',
+                 'password'     => 'password',          // system default
+                 'class_name'   => $class,
+                 'section_name' => $section,
+diff --git a/resources/js/Pages/School/Users/Index.vue b/resources/js/Pages/School/Users/Index.vue
+index d45a9f3..2b9675c 100644
+--- a/resources/js/Pages/School/Users/Index.vue
++++ b/resources/js/Pages/School/Users/Index.vue
+@@ -379,7 +379,7 @@ const getStatusBadgeClass = (active) => active
+                                 </td>
+                                 <td class="px-6 py-4">
+                                     <div class="flex items-center gap-2">
+-                                        <code class="text-[11px] font-black text-indigo-600 bg-indigo-50 px-2 py-1 rounded-md">{{ user.username }}</code>
++                                        <code class="text-[11px] font-black text-indigo-600 bg-indigo-50 px-2 py-1 rounded-md">{{ user.username || user.phone || user.email || '—' }}</code>
+                                     </div>
+                                 </td>
+                                 <td class="px-6 py-4">
+-- 
+2.52.0.windows.1
+

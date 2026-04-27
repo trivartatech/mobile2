@@ -1,0 +1,133 @@
+From 2bc7bbe889c7d596411158e47469e07dd0ff790a Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 10:48:48 +0530
+Subject: [PATCH] fix: dashboard reads real staff_attendances instead of
+ assuming Present
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The school dashboard was reading staff "presence" by inverting the
+approved-leave count: present = total_staff - on_leave. So with no
+attendance ever marked and no leaves filed today, it cheerfully said
+"All staff present" and "0 on leave today" — completely ignoring the
+staff_attendances table.
+
+Now actually queries staff_attendances for today and exposes:
+  staff_present_today    (status in present/late/half_day)
+  staff_absent_today     (status = absent)
+  staff_marked_today     (any status row exists)
+  staff_unmarked_today   (total_staff - marked)
+
+absent_staff card list also now includes staff explicitly marked
+absent or 'leave' in staff_attendances, not just users with approved
+Leave records.
+
+Vue (Dashboard.vue):
+- Staff bento tile now says "Attendance not marked yet" (amber) when
+  no rows exist for today, otherwise "X present · Y unmarked".
+- "People Today" empty-state shows the same amber chip when nothing's
+  marked, instead of the misleading green "All staff present" tick.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ app/Http/Controllers/DashboardController.php | 33 ++++++++++++++++++--
+ resources/js/Pages/School/Dashboard.vue      | 11 ++++++-
+ 2 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/app/Http/Controllers/DashboardController.php b/app/Http/Controllers/DashboardController.php
+index 4956468..e93924c 100644
+--- a/app/Http/Controllers/DashboardController.php
++++ b/app/Http/Controllers/DashboardController.php
+@@ -191,6 +191,21 @@ public function index(Request $request)
+                     ->where('end_date', '>=', $today)
+                     ->count();
+ 
++                // Actual staff attendance for today — pulled from staff_attendances.
++                // Without this we used to assume everyone-not-on-leave was present,
++                // which displayed "All staff present" before any attendance was
++                // ever marked.
++                $staffAttnToday = \App\Models\StaffAttendance::where('school_id', $schoolId)
++                    ->where('date', $today)
++                    ->selectRaw('status, count(*) as count')
++                    ->groupBy('status')
++                    ->pluck('count', 'status')
++                    ->toArray();
++                $staffPresentToday  = ($staffAttnToday['present']  ?? 0) + ($staffAttnToday['late'] ?? 0) + ($staffAttnToday['half_day'] ?? 0);
++                $staffAbsentToday   = $staffAttnToday['absent'] ?? 0;
++                $staffMarkedToday   = array_sum($staffAttnToday);
++                $staffUnmarkedToday = max(0, $totalStaff - $staffMarkedToday);
++
+                 $totalClasses  = \App\Models\CourseClass::where('school_id', $schoolId)->count();
+                 $totalSections = \App\Models\Section::where('school_id', $schoolId)->count();
+ 
+@@ -389,15 +404,23 @@ public function index(Request $request)
+                         'photo' => $s->photo_url,
+                     ]);
+ 
+-                // ── Staff Absent Today (with names) ───────────────────────
+-                $absentStaffIds = \App\Models\Leave::where('school_id', $schoolId)
++                // ── Staff Absent Today (approved leave OR marked-absent) ──
++                $leaveStaffUserIds = \App\Models\Leave::where('school_id', $schoolId)
+                     ->where('status', 'approved')
+                     ->where('start_date', '<=', $today)
+                     ->where('end_date', '>=', $today)
+                     ->pluck('user_id');
+ 
++                $markedAbsentStaffIds = \App\Models\StaffAttendance::where('school_id', $schoolId)
++                    ->where('date', $today)
++                    ->whereIn('status', ['absent', 'leave'])
++                    ->pluck('staff_id');
++
+                 $absentStaffList = \App\Models\Staff::where('school_id', $schoolId)
+-                    ->whereIn('user_id', $absentStaffIds)
++                    ->where(function ($q) use ($leaveStaffUserIds, $markedAbsentStaffIds) {
++                        $q->whereIn('user_id', $leaveStaffUserIds)
++                          ->orWhereIn('id', $markedAbsentStaffIds);
++                    })
+                     ->with(['user', 'designation'])
+                     ->limit(8)->get()
+                     ->map(fn($s) => [
+@@ -487,6 +510,10 @@ public function index(Request $request)
+                         'new_students_month' => $newStudentsThisMonth,
+                         'total_staff'        => $totalStaff,
+                         'staff_on_leave'     => $staffOnLeaveToday,
++                        'staff_present_today'  => $staffPresentToday,
++                        'staff_absent_today'   => $staffAbsentToday,
++                        'staff_marked_today'   => $staffMarkedToday,
++                        'staff_unmarked_today' => $staffUnmarkedToday,
+                         'total_classes'      => $totalClasses,
+                         'total_sections'     => $totalSections,
+                         'today_fee'          => $todayFeeCollection,
+diff --git a/resources/js/Pages/School/Dashboard.vue b/resources/js/Pages/School/Dashboard.vue
+index 68bdb77..222d167 100644
+--- a/resources/js/Pages/School/Dashboard.vue
++++ b/resources/js/Pages/School/Dashboard.vue
+@@ -439,7 +439,12 @@ const activeTab = ref('admissions')
+                     </span> on leave today
+                 </div>
+                 <div class="bento-sub-row">
+-                    <span class="bento-sub-item">{{ fmt(kpi.total_staff - (kpi.staff_on_leave||0)) }} present</span>
++                    <template v-if="(kpi.staff_marked_today ?? 0) === 0">
++                        <span class="bento-sub-item" style="color:#b45309">Attendance not marked yet</span>
++                    </template>
++                    <template v-else>
++                        <span class="bento-sub-item">{{ fmt(kpi.staff_present_today ?? 0) }} present · {{ fmt(kpi.staff_unmarked_today ?? 0) }} unmarked</span>
++                    </template>
+                 </div>
+             </div>
+ 
+@@ -728,6 +733,10 @@ const activeTab = ref('admissions')
+                     <div class="person-card-sub">{{ s.designation }}</div>
+                 </div>
+             </template>
++            <div v-else-if="(kpi.staff_marked_today ?? 0) === 0" class="person-card-empty person-card-empty--amber">
++                <span style="font-size:1.4rem">⏳</span>
++                <span>Staff attendance not marked yet</span>
++            </div>
+             <div v-else class="person-card-empty person-card-empty--green">
+                 <span style="font-size:1.4rem">✓</span>
+                 <span>All staff present</span>
+-- 
+2.52.0.windows.1
+

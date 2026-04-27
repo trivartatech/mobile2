@@ -1,0 +1,251 @@
+From 343698213867f4ee23829a5e68279e44eed92695 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 13:50:59 +0530
+Subject: [PATCH] =?UTF-8?q?feat:=20student=20QR=20badge=20PDF=20=E2=80=94?=
+ =?UTF-8?q?=20same=20pattern=20as=20staff=20badges?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a print-ready PDF for student QR badges, mirroring the staff
+version. 8 badges per A4 page, school header, name, class/section,
+admission_no pill, 26mm QR linking to /q/<student-uuid>.
+
+  GET /school/students/export-qr-pdf?class_id=X&section_id=Y
+
+Honours the same class/section filters as the existing Excel export.
+"QR Badges PDF" button added to Pages/School/Students/Index.vue
+header; the existing Excel button renamed to "QR Excel" to match.
+
+Pure new feature — doesn't touch the existing Excel export logic.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/School/StudentController.php  |  55 +++++++++
+ resources/js/Pages/School/Students/Index.vue  |   6 +-
+ .../views/exports/student-badges.blade.php    | 113 ++++++++++++++++++
+ routes/web.php                                |   3 +-
+ 4 files changed, 175 insertions(+), 2 deletions(-)
+ create mode 100644 resources/views/exports/student-badges.blade.php
+
+diff --git a/app/Http/Controllers/School/StudentController.php b/app/Http/Controllers/School/StudentController.php
+index 4778da8..8e4968f 100644
+--- a/app/Http/Controllers/School/StudentController.php
++++ b/app/Http/Controllers/School/StudentController.php
+@@ -860,6 +860,61 @@ public function exportQRCodes(Request $request)
+         );
+     }
+ 
++    /**
++     * GET /school/students/export-qr-pdf
++     * Print-ready PDF — 8 student badges per A4 page, each with the school
++     * header, name, class · section, admission_no pill, and a 26mm QR linking
++     * to /q/<student-uuid>. Filterable by class_id and section_id.
++     */
++    public function exportQrCodesPdf(Request $request)
++    {
++        $schoolId       = app('current_school_id');
++        $academicYearId = app('current_academic_year_id');
++        $classId        = $request->integer('class_id') ?: null;
++        $sectionId      = $request->integer('section_id') ?: null;
++        $school         = app('current_school');
++
++        $query = \App\Models\Student::with(['currentAcademicHistory.courseClass', 'currentAcademicHistory.section'])
++            ->where('school_id', $schoolId)
++            ->whereNotNull('uuid');
++
++        if ($classId) {
++            $query->whereHas('currentAcademicHistory', fn($q) => $q->where('academic_year_id', $academicYearId)->where('class_id', $classId));
++        }
++        if ($sectionId) {
++            $query->whereHas('currentAcademicHistory', fn($q) => $q->where('academic_year_id', $academicYearId)->where('section_id', $sectionId));
++        }
++
++        $students = $query->orderBy('first_name')->get();
++
++        $writer = new \Endroid\QrCode\Writer\PngWriter();
++        $rows = $students->map(function ($s) use ($writer) {
++            $url = url('/q/' . $s->uuid);
++            $qr  = new \Endroid\QrCode\QrCode($url);
++            $qr->setSize(280);
++            $qr->setMargin(6);
++            $png = $writer->write($qr)->getString();
++            $h = $s->currentAcademicHistory;
++            return [
++                'admission_no' => $s->admission_no,
++                'roll_no'      => $s->roll_no,
++                'name'         => trim(($s->first_name ?? '') . ' ' . ($s->last_name ?? '')),
++                'class'        => $h?->courseClass?->name,
++                'section'      => $h?->section?->name,
++                'qr_data_uri'  => 'data:image/png;base64,' . base64_encode($png),
++            ];
++        })->all();
++
++        $pdf = \Barryvdh\DomPDF\Facade\Pdf::loadView('exports.student-badges', [
++            'rows'    => $rows,
++            'school'  => $school,
++            'title'   => ($school?->name ?? 'School') . ' — Student ID Badges',
++            'printed' => now()->format('d M Y, h:i A'),
++        ])->setPaper('a4', 'portrait');
++
++        return $pdf->download('student-badges-' . now()->format('Y-m-d_His') . '.pdf');
++    }
++
+     /**
+      * GET /school/students/bulk-photo
+      */
+diff --git a/resources/js/Pages/School/Students/Index.vue b/resources/js/Pages/School/Students/Index.vue
+index 51fb577..d38c78a 100644
+--- a/resources/js/Pages/School/Students/Index.vue
++++ b/resources/js/Pages/School/Students/Index.vue
+@@ -117,9 +117,13 @@ watch([search, selectedClass, selectedSection, selectedHouse, perPage], debounce
+                 <option value="">All Houses</option>
+                 <option v-for="h in houses" :key="h.id" :value="h.id">{{ h.name }}</option>
+             </select>
++            <Button variant="secondary" size="sm" as="a" :href="`/school/students/export-qr-pdf?class_id=${selectedClass}&section_id=${selectedSection}`" target="_blank" title="Print-ready PDF — 8 badges per A4 page">
++                <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m0 14v1m8-9h-1M5 12H4m11.314-6.314l-.707.707M6.393 17.607l-.707.707M17.607 17.607l-.707-.707M6.393 6.393l-.707-.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"/></svg>
++                QR Badges PDF
++            </Button>
+             <Button variant="secondary" size="sm" as="a" :href="`/school/students/export-qr?class_id=${selectedClass}&section_id=${selectedSection}`" title="Export QR codes to Excel">
+                 <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+-                Export QRs
++                QR Excel
+             </Button>
+         </FilterBar>
+ 
+diff --git a/resources/views/exports/student-badges.blade.php b/resources/views/exports/student-badges.blade.php
+new file mode 100644
+index 0000000..0dba38d
+--- /dev/null
++++ b/resources/views/exports/student-badges.blade.php
+@@ -0,0 +1,113 @@
++<!DOCTYPE html>
++<html>
++<head>
++<meta charset="utf-8">
++<title>{{ $title }}</title>
++<style>
++    @page { margin: 10mm; }
++    * { box-sizing: border-box; }
++    body { font-family: DejaVu Sans, sans-serif; color: #1A237E; margin: 0; padding: 0; }
++
++    .header {
++        text-align: center; padding: 6mm 0 4mm; border-bottom: 1.5px solid #6A1B9A;
++        margin-bottom: 6mm;
++    }
++    .header-school { font-size: 14pt; font-weight: 800; }
++    .header-meta   { font-size: 9pt; color: #607D8B; margin-top: 2mm; }
++
++    /* 2 columns × 4 rows = 8 badges per A4 page */
++    .grid { width: 100%; }
++    .grid td { width: 50%; padding: 3mm; vertical-align: top; }
++
++    .badge {
++        border: 1.5px solid #6A1B9A; border-radius: 6px;
++        padding: 4mm; height: 55mm;
++        background: #fff;
++    }
++    .badge-top {
++        border-bottom: 1px dashed #E1BEE7; padding-bottom: 2mm; margin-bottom: 3mm;
++    }
++    .badge-school { font-size: 9pt; font-weight: 700; color: #6A1B9A; }
++    .badge-tag    { font-size: 6pt; color: #90A4AE; letter-spacing: 1px; text-transform: uppercase; }
++
++    .badge-row { width: 100%; }
++    .badge-row td { vertical-align: top; padding: 0; }
++    .badge-info-cell { width: 60%; padding-right: 3mm !important; }
++    .badge-qr-cell   { width: 40%; text-align: right; }
++    .badge-qr-cell img { width: 26mm; height: 26mm; }
++
++    .badge-name        { font-size: 11pt; font-weight: 800; color: #4A148C; }
++    .badge-class       { font-size: 8pt; color: #455A64; margin-top: 1.5mm; }
++    .badge-roll        { font-size: 7.5pt; color: #78909C; margin-top: 1mm; }
++    .badge-admno {
++        font-size: 7pt; font-weight: 700; color: #6A1B9A;
++        background: #F3E5F5; display: inline-block;
++        padding: 1mm 2.5mm; border-radius: 2mm; margin-top: 2mm;
++        font-family: DejaVu Sans Mono, monospace;
++    }
++
++    .footer-strip {
++        margin-top: 2mm; padding-top: 1.5mm;
++        border-top: 1px dashed #ECEFF1;
++        font-size: 6.5pt; color: #B0BEC5; text-align: center;
++    }
++
++    .pagebreak { page-break-after: always; }
++</style>
++</head>
++<body>
++
++<div class="header">
++    <div class="header-school">{{ $school?->name ?? 'School' }}</div>
++    <div class="header-meta">Student ID Badges &nbsp;·&nbsp; Generated {{ $printed }} &nbsp;·&nbsp; {{ count($rows) }} badge{{ count($rows) === 1 ? '' : 's' }}</div>
++</div>
++
++@php $cells = collect($rows)->chunk(2); @endphp
++
++<table class="grid" cellpadding="0" cellspacing="0">
++@foreach ($cells->chunk(4) as $pageIndex => $page)
++    @foreach ($page as $row)
++        <tr>
++        @foreach ($row as $r)
++            <td>
++                <div class="badge">
++                    <div class="badge-top">
++                        <div class="badge-school">{{ $school?->name ?? 'School' }}</div>
++                        <div class="badge-tag">Student ID</div>
++                    </div>
++                    <table class="badge-row" cellpadding="0" cellspacing="0">
++                        <tr>
++                            <td class="badge-info-cell">
++                                <div class="badge-name">{{ $r['name'] ?? '—' }}</div>
++                                <div class="badge-class">
++                                    {{ collect([$r['class'] ?? null, $r['section'] ?? null])->filter()->implode(' · ') ?: '—' }}
++                                </div>
++                                @if (!empty($r['roll_no']))
++                                    <div class="badge-roll">Roll No: {{ $r['roll_no'] }}</div>
++                                @endif
++                                <div class="badge-admno">{{ $r['admission_no'] ?? '—' }}</div>
++                            </td>
++                            <td class="badge-qr-cell">
++                                @if (!empty($r['qr_data_uri']))
++                                    <img src="{{ $r['qr_data_uri'] }}" />
++                                @endif
++                            </td>
++                        </tr>
++                    </table>
++                    <div class="footer-strip">Scan to mark attendance</div>
++                </div>
++            </td>
++        @endforeach
++        @if ($row->count() === 1)
++            <td></td>
++        @endif
++        </tr>
++    @endforeach
++    @if (!$loop->last)
++        <tr><td colspan="2" class="pagebreak"></td></tr>
++    @endif
++@endforeach
++</table>
++
++</body>
++</html>
+diff --git a/routes/web.php b/routes/web.php
+index d82522e..941ba04 100644
+--- a/routes/web.php
++++ b/routes/web.php
+@@ -271,7 +271,8 @@
+             Route::get('students/search', [\App\Http\Controllers\School\StudentController::class, 'search'])->name('students.search');
+             Route::get('students/scanner', [\App\Http\Controllers\School\StudentController::class, 'qrProfileScanner'])->name('students.scanner');
+             Route::post('students/scan-by-uuid', [\App\Http\Controllers\School\StudentController::class, 'scanByUuid'])->name('students.scan-by-uuid');
+-            Route::get('students/export-qr', [\App\Http\Controllers\School\StudentController::class, 'exportQRCodes'])->name('students.export-qr');
++            Route::get('students/export-qr',     [\App\Http\Controllers\School\StudentController::class, 'exportQRCodes'])->name('students.export-qr');
++            Route::get('students/export-qr-pdf', [\App\Http\Controllers\School\StudentController::class, 'exportQrCodesPdf'])->name('students.export-qr-pdf');
+             Route::get('students/bulk-photo', [\App\Http\Controllers\School\StudentController::class, 'bulkPhotoUploadForm'])->name('students.bulk-photo');
+             Route::post('students/bulk-photo', [\App\Http\Controllers\School\StudentController::class, 'processBulkPhotoUpload'])->name('students.bulk-photo.store');
+             Route::get('students/{student}/request-edit', [\App\Http\Controllers\School\StudentController::class, 'createRequest'])->name('students.request-edit');
+-- 
+2.52.0.windows.1
+

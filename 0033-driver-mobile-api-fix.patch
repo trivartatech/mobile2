@@ -1,0 +1,293 @@
+From 43a42f02c539860e0d61b3dee04327b0c5c9a081 Mon Sep 17 00:00:00 2001
+From: Prajw <prajw@trivartatech>
+Date: Mon, 27 Apr 2026 18:34:33 +0530
+Subject: [PATCH] =?UTF-8?q?feat:=20driver=20mobile=20API=20=E2=80=94=20veh?=
+ =?UTF-8?q?icle=20list,=20GPS=20tracking,=20attendance=20marking?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three driver-tracking endpoints (vehicles list, GPS update, stop) plus
+two transport-attendance endpoints (roster, bulk mark) wired into the
+mobile API. Without these the driver tab in the app silently 404s on
+every GPS push and the vehicle picker never populates.
+
+Routes (all under /api/mobile/, behind auth:sanctum + tenant):
+- GET  /transport/driver/vehicles           → list of vehicles assigned
+                                              to the logged-in driver/
+                                              conductor
+- POST /transport/driver-tracking/update    → live GPS push (10s loop)
+- POST /transport/driver-tracking/stop      → mark vehicle offline
+- GET  /transport/attendance/students       → roster for a route+date+
+                                              trip with current status
+- POST /transport/attendance/mark           → bulk-save boarding /
+                                              drop-off attendance,
+                                              fires parent notifications
+                                              via NotificationService
+
+DriverTrackingController gets a new assignedVehicles() method that
+filters to driver_id OR conductor_id matches and returns a flat shape
+the mobile UI expects (id, vehicle_number, route_name, capacity).
+
+MobileApiController gets transportAttendanceStudents() and
+transportAttendanceMark() — JSON twins of the existing web
+TransportAttendanceController. Driver/conductor scope is enforced; a
+driver can only mark students on routes their assigned vehicles run.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../Controllers/Api/MobileApiController.php   | 161 ++++++++++++++++++
+ .../Transport/DriverTrackingController.php    |  43 +++++
+ routes/api.php                                |  10 ++
+ 3 files changed, 214 insertions(+)
+
+diff --git a/app/Http/Controllers/Api/MobileApiController.php b/app/Http/Controllers/Api/MobileApiController.php
+index 309a867..fcda381 100644
+--- a/app/Http/Controllers/Api/MobileApiController.php
++++ b/app/Http/Controllers/Api/MobileApiController.php
+@@ -895,6 +895,167 @@ public function transport(Request $request): JsonResponse
+         ]);
+     }
+ 
++    // ── Transport attendance (driver app) ─────────────────────────────────────
++
++    /**
++     * GET /mobile/transport/attendance/students
++     *
++     * Returns the student roster for a route + date + trip type, with each
++     * student's current attendance status (if already marked). Drivers see
++     * only routes assigned to vehicles they drive.
++     */
++    public function transportAttendanceStudents(Request $request): JsonResponse
++    {
++        $user      = $request->user();
++        $school    = app('current_school');
++        $routeId   = $request->integer('route_id');
++        $date      = $request->input('date', now()->toDateString());
++        $tripType  = $request->input('trip_type', 'pickup');
++
++        if (!$routeId) {
++            return response()->json(['students' => []]);
++        }
++
++        // Drivers can only see routes their vehicles run on
++        $role = $user->user_type instanceof \App\Enums\UserType ? $user->user_type->value : (string) $user->user_type;
++        if (in_array($role, ['driver', 'conductor'])) {
++            $staffId = \App\Models\Staff::where('user_id', $user->id)->where('school_id', $school->id)->value('id');
++            $allowed = \App\Models\TransportVehicle::where('school_id', $school->id)
++                ->where(function ($q) use ($staffId) {
++                    $q->where('driver_id', $staffId)->orWhere('conductor_id', $staffId);
++                })
++                ->where('route_id', $routeId)
++                ->exists();
++            if (!$allowed) return response()->json(['students' => []]);
++        }
++
++        $allocations = TransportStudentAllocation::where('school_id', $school->id)
++            ->where('route_id', $routeId)
++            ->where('status', 'active')
++            ->whereIn('pickup_type', [$tripType, 'both'])
++            ->with([
++                'student:id,first_name,last_name,admission_no,user_id',
++                'student.user:id,name',
++                'stop:id,stop_name,stop_order',
++            ])
++            ->get();
++
++        $existing = \App\Models\TransportAttendance::where('school_id', $school->id)
++            ->where('route_id', $routeId)
++            ->where('date', $date)
++            ->where('trip_type', $tripType)
++            ->get()
++            ->keyBy('student_id');
++
++        $students = $allocations->map(function ($a) use ($existing) {
++            $att      = $existing->get($a->student_id);
++            $student  = $a->student;
++            $name     = $student?->user?->name
++                     ?? trim(($student?->first_name ?? '') . ' ' . ($student?->last_name ?? ''));
++            return [
++                'student_id'   => $a->student_id,
++                'name'         => $name ?: '—',
++                'admission_no' => $student?->admission_no ?? '—',
++                'stop_name'    => $a->stop?->stop_name ?? '—',
++                'stop_order'   => $a->stop?->stop_order ?? 0,
++                'vehicle_id'   => $a->vehicle_id,
++                'status'       => $att?->status,         // null if not yet marked
++                'boarded_at'   => $att?->boarded_at,
++                'notes'        => $att?->notes,
++            ];
++        })->sortBy('stop_order')->values();
++
++        return response()->json(['students' => $students]);
++    }
++
++    /**
++     * POST /mobile/transport/attendance/mark
++     *
++     * Bulk-saves transport attendance for a route + date + trip. Mirrors the
++     * web TransportAttendanceController::store but returns JSON so the mobile
++     * app can show a confirmation. Triggers parent push/SMS via NotificationService.
++     */
++    public function transportAttendanceMark(Request $request): JsonResponse
++    {
++        $user   = $request->user();
++        $school = app('current_school');
++
++        $validated = $request->validate([
++            'route_id'             => 'required|integer',
++            'date'                 => 'required|date',
++            'trip_type'            => 'required|in:pickup,drop',
++            'records'              => 'required|array|min:1',
++            'records.*.student_id' => 'required|integer',
++            'records.*.status'     => 'required|in:present,absent,late',
++            'records.*.boarded_at' => 'nullable',
++            'records.*.notes'      => 'nullable|string|max:255',
++        ]);
++
++        // Driver/conductor scope check
++        $role = $user->user_type instanceof \App\Enums\UserType ? $user->user_type->value : (string) $user->user_type;
++        if (in_array($role, ['driver', 'conductor'])) {
++            $staffId = \App\Models\Staff::where('user_id', $user->id)->where('school_id', $school->id)->value('id');
++            $allowed = \App\Models\TransportVehicle::where('school_id', $school->id)
++                ->where(function ($q) use ($staffId) {
++                    $q->where('driver_id', $staffId)->orWhere('conductor_id', $staffId);
++                })
++                ->where('route_id', $validated['route_id'])
++                ->exists();
++            if (!$allowed) return response()->json(['message' => 'Not assigned to this route.'], 403);
++        }
++
++        $vehicle = \App\Models\TransportVehicle::where('school_id', $school->id)
++            ->where('route_id', $validated['route_id'])->first();
++
++        $stopsByStudent = TransportStudentAllocation::where('school_id', $school->id)
++            ->where('route_id', $validated['route_id'])
++            ->where('status', 'active')
++            ->with('stop:id,stop_name')
++            ->get()
++            ->keyBy('student_id');
++
++        $saved = 0;
++        foreach ($validated['records'] as $rec) {
++            \App\Models\TransportAttendance::updateOrCreate(
++                [
++                    'school_id'  => $school->id,
++                    'student_id' => $rec['student_id'],
++                    'date'       => $validated['date'],
++                    'trip_type'  => $validated['trip_type'],
++                ],
++                [
++                    'route_id'   => $validated['route_id'],
++                    'vehicle_id' => $vehicle?->id,
++                    'status'     => $rec['status'],
++                    'boarded_at' => $rec['boarded_at'] ?? null,
++                    'notes'      => $rec['notes'] ?? null,
++                    'marked_by'  => $user->id,
++                ]
++            );
++            $saved++;
++        }
++
++        // Fire parent notifications (non-fatal — failures are logged)
++        try {
++            $notifier = new \App\Services\NotificationService($school);
++            $studentIds = collect($validated['records'])->pluck('student_id');
++            $students = \App\Models\Student::whereIn('id', $studentIds)
++                ->with(['user:id,name', 'studentParent.user'])
++                ->get()->keyBy('id');
++            foreach ($validated['records'] as $rec) {
++                $student  = $students->get($rec['student_id']);
++                $stopName = $stopsByStudent->get($rec['student_id'])?->stop?->stop_name;
++                if ($student) {
++                    $notifier->notifyTransportAttendance($student, $rec['status'], $validated['trip_type'], $stopName);
++                }
++            }
++        } catch (\Throwable $e) {
++            \Illuminate\Support\Facades\Log::warning('Transport attendance push failed: ' . $e->getMessage());
++        }
++
++        return response()->json(['success' => true, 'saved' => $saved]);
++    }
++
+     // ── Announcements ─────────────────────────────────────────────────────────
+ 
+     public function announcements(Request $request): JsonResponse
+diff --git a/app/Http/Controllers/Api/Transport/DriverTrackingController.php b/app/Http/Controllers/Api/Transport/DriverTrackingController.php
+index defc958..d8e1360 100644
+--- a/app/Http/Controllers/Api/Transport/DriverTrackingController.php
++++ b/app/Http/Controllers/Api/Transport/DriverTrackingController.php
+@@ -11,6 +11,49 @@
+ 
+ class DriverTrackingController extends Controller
+ {
++    /**
++     * Assigned vehicles for the logged-in driver/conductor.
++     * Used by the mobile Route screen to populate the vehicle picker.
++     * Returns a flat shape the mobile UI expects: id, vehicle_number,
++     * route_name, capacity.
++     */
++    public function assignedVehicles(Request $request): JsonResponse
++    {
++        $schoolId = app('current_school_id');
++        $user     = $request->user();
++
++        $staffId = \App\Models\Staff::where('user_id', $user->id)
++            ->where('school_id', $schoolId)
++            ->value('id');
++
++        if (!$staffId) {
++            return response()->json(['vehicles' => [], 'data' => []]);
++        }
++
++        $vehicles = TransportVehicle::where('school_id', $schoolId)
++            ->where('status', 'active')
++            ->where(function ($q) use ($staffId) {
++                $q->where('driver_id', $staffId)
++                  ->orWhere('conductor_id', $staffId);
++            })
++            ->with(['route:id,route_name,route_code'])
++            ->orderBy('vehicle_number')
++            ->get()
++            ->map(fn ($v) => [
++                'id'             => $v->id,
++                'vehicle_number' => $v->vehicle_number,
++                'vehicle_name'   => $v->vehicle_name,
++                'route_name'     => $v->route?->route_name,
++                'route_code'     => $v->route?->route_code,
++                'capacity'       => $v->capacity,
++            ])
++            ->values();
++
++        // Returned twice under different keys for mobile-client compatibility:
++        // older code reads `data`, newer code reads `vehicles`.
++        return response()->json(['vehicles' => $vehicles, 'data' => $vehicles]);
++    }
++
+     /**
+      * List all active vehicles with their live status.
+      */
+diff --git a/routes/api.php b/routes/api.php
+index ff1419b..2d728dc 100644
+--- a/routes/api.php
++++ b/routes/api.php
+@@ -110,6 +110,16 @@
+     Route::get('/fees/{id}',                  [$MA, 'feeDetail'])->whereNumber('id')->name('api.mobile.fees.detail');
+     Route::get('/exams',                      [$MA, 'exams'])->name('api.mobile.exams');
+     Route::get('/transport/live',             [$MA, 'transport'])->name('api.mobile.transport');
++
++    // Driver tracking (used by the mobile driver app)
++    $DT = \App\Http\Controllers\Api\Transport\DriverTrackingController::class;
++    Route::get ('/transport/driver/vehicles',         [$DT, 'assignedVehicles'])->name('api.mobile.driver.vehicles');
++    Route::post('/transport/driver-tracking/update',  [$DT, 'update'])->name('api.mobile.driver-tracking.update');
++    Route::post('/transport/driver-tracking/stop',    [$DT, 'stop'])->name('api.mobile.driver-tracking.stop');
++
++    // Transport attendance (driver marks students boarded / dropped)
++    Route::get ('/transport/attendance/students',     [$MA, 'transportAttendanceStudents'])->name('api.mobile.transport.attendance.students');
++    Route::post('/transport/attendance/mark',         [$MA, 'transportAttendanceMark'])->name('api.mobile.transport.attendance.mark');
+     Route::get('/announcements',              [$MA, 'announcements'])->name('api.mobile.announcements');
+ 
+     // Multi-child (parent)
+-- 
+2.52.0.windows.1
+
